@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use std::fs::File;
-use std::io::{self, Read};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io;
+use std::net::{IpAddr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -92,7 +92,20 @@ impl Server {
 					// we do not want.
 					stream.set_nonblocking(false)?;
 
-					let peer_addr = PeerAddr(peer_addr);
+					let mut peer_addr = PeerAddr(peer_addr);
+
+					// attempt to see if it an ipv4-mapped ipv6
+					// if yes convert to ipv4
+					if peer_addr.0.is_ipv6() {
+						if let IpAddr::V6(ipv6) = peer_addr.0.ip() {
+							if let Some(ipv4) = ipv6.to_ipv4() {
+								peer_addr = PeerAddr(SocketAddr::V4(SocketAddrV4::new(
+									ipv4,
+									peer_addr.0.port(),
+								)))
+							}
+						}
+					}
 
 					if self.check_undesirable(&stream) {
 						// Shutdown the incoming TCP connection if it is not desired
@@ -322,14 +335,8 @@ impl ChainAdapter for DummyAdapter {
 	fn locate_headers(&self, _: &[Hash]) -> Result<Vec<core::BlockHeader>, chain::Error> {
 		Ok(vec![])
 	}
-	fn get_block(&self, _: Hash) -> Option<core::Block> {
+	fn get_block(&self, _: Hash, _: &PeerInfo) -> Option<core::Block> {
 		None
-	}
-	fn kernel_data_read(&self) -> Result<File, chain::Error> {
-		unimplemented!()
-	}
-	fn kernel_data_write(&self, _reader: &mut dyn Read) -> Result<bool, chain::Error> {
-		unimplemented!()
 	}
 	fn txhashset_read(&self, _h: Hash) -> Option<TxHashSetRead> {
 		unimplemented!()

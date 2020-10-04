@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -260,6 +260,7 @@ fn comments() -> HashMap<String, String> {
 	retval.insert(
 		"seeding_type".to_string(),
 		"
+#All seeds/peers can be either IP address or DNS names. Port number must always be specified
 #how to seed this server, can be None, List or DNSSeed
 "
 		.to_string(),
@@ -485,10 +486,10 @@ fn comments() -> HashMap<String, String> {
 }
 
 fn get_key(line: &str) -> String {
-	if line.contains("[") && line.contains("]") {
+	if line.contains('[') && line.contains(']') {
 		return line.to_owned();
-	} else if line.contains("=") {
-		return line.split("=").collect::<Vec<&str>>()[0].trim().to_owned();
+	} else if line.contains('=') {
+		return line.split('=').collect::<Vec<&str>>()[0].trim().to_owned();
 	} else {
 		return "NOT_FOUND".to_owned();
 	}
@@ -496,7 +497,7 @@ fn get_key(line: &str) -> String {
 
 pub fn insert_comments(orig: String) -> String {
 	let comments = comments();
-	let lines: Vec<&str> = orig.split("\n").collect();
+	let lines: Vec<&str> = orig.split('\n').collect();
 	let mut out_lines = vec![];
 	for l in lines {
 		let key = get_key(l);
@@ -510,5 +511,5 @@ pub fn insert_comments(orig: String) -> String {
 	for l in out_lines {
 		ret_val.push_str(&l);
 	}
-	ret_val.to_owned()
+	ret_val
 }

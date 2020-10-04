@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ impl Writeable for BlockSums {
 }
 
 impl Readable for BlockSums {
-	fn read(reader: &mut dyn Reader) -> Result<BlockSums, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<BlockSums, ser::Error> {
 		Ok(BlockSums {
 			utxo_sum: Commitment::read(reader)?,
 			kernel_sum: Commitment::read(reader)?,

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ extern crate serde_derive;
 #[macro_use]
 extern crate log;
 
+mod codec;
 mod conn;
 pub mod handshake;
 pub mod msg;

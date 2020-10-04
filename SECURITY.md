@@ -34,10 +34,9 @@ and [details](https://github.com/RD-Crypto-Spec/Responsible-Disclosure/tree/82e0
 guidelines. More information is available about the
 [expected timelines for the full disclosure cycle](https://github.com/RD-Crypto-Spec/Responsible-Disclosure/tree/82e08d2736ea9dbe43484a3317e4bce214163bd0#standard-disclosure-timelines).
 
-For all security related issues, Grin has 3 main points of contact:
+For all security related issues, Grin has 2 main points of contact:
 
 * Daniel Lehnberg, daniel.lehnberg at protonmail.com [PGP key](https://github.com/mimblewimble/grin-security/blob/master/keys/lehnberg.asc)
-* hashmap, hashmap.dev at protonmail.com [PGP key](https://github.com/mimblewimble/grin-security/blob/master/keys/hashmap.asc)
 * John Woeltz, joltz at protonmail.com [PGP key](https://github.com/mimblewimble/grin-security/blob/master/keys/j01tz.asc)
 
 Send all communications PGP encrypted to all parties.
@@ -77,7 +76,7 @@ page linked from our website, with a links of their choosing.
 
 There is not currently a formal bug bounty program for Grin as it would require
 a high level of resources and engagement to operate in good faith. More
-[funding](https://grin-tech.org/funding) can help provide the necessary
+[funding](https://grin.mw/fund) can help provide the necessary
 resources to run one in the future for the Grin community.
 
 ## Deviations from the Standard

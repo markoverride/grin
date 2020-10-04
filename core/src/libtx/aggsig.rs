@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -83,12 +83,12 @@ pub fn create_secnonce(secp: &Secp256k1) -> Result<SecretKey, Error> {
 /// // ... Encode message
 /// let message = Message::from_slice(&msg_bytes).unwrap();
 /// let sig_part = aggsig::calculate_partial_sig(
-///		&secp,
-///		&secret_key,
-///		&secret_nonce,
-///		&pub_nonce_sum,
-///		Some(&pub_key_sum),
-///		&message,
+///     &secp,
+///     &secret_key,
+///     &secret_nonce,
+///     &pub_nonce_sum,
+///     Some(&pub_key_sum),
+///     &message,
 ///).unwrap();
 /// ```
 
@@ -153,12 +153,12 @@ pub fn calculate_partial_sig(
 /// // ... Encode message
 /// let message = Message::from_slice(&msg_bytes).unwrap();
 /// let sig_part = aggsig::calculate_partial_sig(
-///		&secp,
-///		&secret_key,
-///		&secret_nonce,
-///		&pub_nonce_sum,
-///		Some(&pub_key_sum),
-///		&message,
+///     &secp,
+///     &secret_key,
+///     &secret_nonce,
+///     &pub_nonce_sum,
+///     Some(&pub_key_sum),
+///     &message,
 ///).unwrap();
 ///
 /// // Now verify the signature, ensuring the same values used to create
@@ -166,12 +166,12 @@ pub fn calculate_partial_sig(
 /// let public_key = PublicKey::from_secret_key(&secp, &secret_key).unwrap();
 ///
 /// let result = aggsig::verify_partial_sig(
-///		&secp,
-///		&sig_part,
-///		&pub_nonce_sum,
-///		&public_key,
-///		Some(&pub_key_sum),
-///		&message,
+///     &secp,
+///     &sig_part,
+///     &pub_nonce_sum,
+///     &public_key,
+///     Some(&pub_key_sum),
+///     &message,
 ///);
 /// ```
 
@@ -192,9 +192,7 @@ pub fn verify_partial_sig(
 		pubkey_sum,
 		true,
 	) {
-		Err(ErrorKind::Signature(
-			"Signature validation error".to_string(),
-		))?
+		return Err(ErrorKind::Signature("Signature validation error".to_string()).into());
 	}
 	Ok(())
 }
@@ -233,15 +231,11 @@ pub fn verify_partial_sig(
 /// let fees = 10_000;
 /// let value = reward(fees);
 /// let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
-/// let switch = &SwitchCommitmentType::Regular;
+/// let switch = SwitchCommitmentType::Regular;
 /// let commit = keychain.commit(value, &key_id, switch).unwrap();
 /// let builder = proof::ProofBuilder::new(&keychain);
-/// let rproof = proof::create(&keychain, &builder, value, &key_id, switch, commit, None).unwrap();
-/// let output = Output {
-///		features: OutputFeatures::Coinbase,
-///		commit: commit,
-///		proof: rproof,
-/// };
+/// let proof = proof::create(&keychain, &builder, value, &key_id, switch, commit, None).unwrap();
+/// let output = Output::new(OutputFeatures::Coinbase, commit, proof);
 /// let height = 20;
 /// let over_commit = secp.commit_value(reward(fees)).unwrap();
 /// let out_commit = output.commitment();
@@ -264,7 +258,7 @@ pub fn sign_from_key_id<K>(
 where
 	K: Keychain,
 {
-	let skey = k.derive_key(value, key_id, &SwitchCommitmentType::Regular)?; // TODO: proper support for different switch commitment schemes
+	let skey = k.derive_key(value, key_id, SwitchCommitmentType::Regular)?; // TODO: proper support for different switch commitment schemes
 	let sig = aggsig::sign_single(secp, &msg, &skey, s_nonce, None, None, blind_sum, None)?;
 	Ok(sig)
 }
@@ -300,15 +294,11 @@ where
 /// let fees = 10_000;
 /// let value = reward(fees);
 /// let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
-/// let switch = &SwitchCommitmentType::Regular;
+/// let switch = SwitchCommitmentType::Regular;
 /// let commit = keychain.commit(value, &key_id, switch).unwrap();
 /// let builder = proof::ProofBuilder::new(&keychain);
-/// let rproof = proof::create(&keychain, &builder, value, &key_id, switch, commit, None).unwrap();
-/// let output = Output {
-///		features: OutputFeatures::Coinbase,
-///		commit: commit,
-///		proof: rproof,
-/// };
+/// let proof = proof::create(&keychain, &builder, value, &key_id, switch, commit, None).unwrap();
+/// let output = Output::new(OutputFeatures::Coinbase, commit, proof);
 /// let height = 20;
 /// let over_commit = secp.commit_value(reward(fees)).unwrap();
 /// let out_commit = output.commitment();
@@ -320,7 +310,7 @@ where
 ///
 /// // Verify the signature from the excess commit
 /// let sig_verifies =
-///		aggsig::verify_single_from_commit(&keychain.secp(), &sig, &msg, &excess);
+///     aggsig::verify_single_from_commit(&keychain.secp(), &sig, &msg, &excess);
 /// assert!(!sig_verifies.is_err());
 /// ```
 
@@ -332,9 +322,7 @@ pub fn verify_single_from_commit(
 ) -> Result<(), Error> {
 	let pubkey = commit.to_pubkey(secp)?;
 	if !verify_single(secp, sig, msg, None, &pubkey, Some(&pubkey), false) {
-		Err(ErrorKind::Signature(
-			"Signature validation error".to_string(),
-		))?
+		return Err(ErrorKind::Signature("Signature validation error".to_string()).into());
 	}
 	Ok(())
 }
@@ -376,21 +364,21 @@ pub fn verify_single_from_commit(
 /// // ... Encode message
 /// let message = Message::from_slice(&msg_bytes).unwrap();
 /// let sig_part = aggsig::calculate_partial_sig(
-///		&secp,
-///		&secret_key,
-///		&secret_nonce,
-///		&pub_nonce_sum,
-///		Some(&pub_key_sum),
-///		&message,
+///     &secp,
+///     &secret_key,
+///     &secret_nonce,
+///     &pub_nonce_sum,
+///     Some(&pub_key_sum),
+///     &message,
 /// ).unwrap();
 /// // ... Verify above, once all signatures have been added together
 /// let sig_verifies = aggsig::verify_completed_sig(
-///		&secp,
-///		&sig_part,
-///		&pub_key_sum,
-///		Some(&pub_key_sum),
-///		&message,
-///		);
+///     &secp,
+///     &sig_part,
+///     &pub_key_sum,
+///     Some(&pub_key_sum),
+///     &message,
+///     );
 /// assert!(!sig_verifies.is_err());
 /// ```
 
@@ -402,9 +390,7 @@ pub fn verify_completed_sig(
 	msg: &secp::Message,
 ) -> Result<(), Error> {
 	if !verify_single(secp, sig, msg, None, pubkey, pubkey_sum, true) {
-		Err(ErrorKind::Signature(
-			"Signature validation error".to_string(),
-		))?
+		return Err(ErrorKind::Signature("Signature validation error".to_string()).into());
 	}
 	Ok(())
 }
@@ -447,6 +433,16 @@ pub fn verify_single(
 	)
 }
 
+/// Verify a batch of signatures.
+pub fn verify_batch(
+	secp: &Secp256k1,
+	sigs: &Vec<Signature>,
+	msgs: &Vec<Message>,
+	pubkeys: &Vec<PublicKey>,
+) -> bool {
+	aggsig::verify_batch(secp, sigs, msgs, pubkeys)
+}
+
 /// Just a simple sig, creates its own nonce, etc
 pub fn sign_with_blinding(
 	secp: &Secp256k1,
@@ -455,7 +451,6 @@ pub fn sign_with_blinding(
 	pubkey_sum: Option<&PublicKey>,
 ) -> Result<Signature, Error> {
 	let skey = &blinding.secret_key(&secp)?;
-	//let pubkey_sum = PublicKey::from_secret_key(&secp, &skey)?;
 	let sig = aggsig::sign_single(secp, &msg, skey, None, None, None, pubkey_sum, None)?;
 	Ok(sig)
 }

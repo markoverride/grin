@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ use bit_vec::BitVec;
 use croaring::Bitmap;
 
 use crate::core::core::hash::{DefaultHashable, Hash};
-use crate::core::core::pmmr::{self, ReadonlyPMMR, VecBackend, PMMR};
-use crate::core::ser::{self, FixedLength, PMMRable, Readable, Reader, Writeable, Writer};
+use crate::core::core::pmmr::{self, ReadablePMMR, ReadonlyPMMR, VecBackend, PMMR};
+use crate::core::ser::{self, PMMRable, Readable, Reader, Writeable, Writer};
 use crate::error::{Error, ErrorKind};
 
 /// The "bitmap accumulator" allows us to commit to a specific bitmap by splitting it into
@@ -149,7 +149,7 @@ impl BitmapAccumulator {
 		let chunk_pos = pmmr::insertion_to_pmmr_index(chunk_idx + 1);
 		let rewind_pos = chunk_pos.saturating_sub(1);
 		pmmr.rewind(rewind_pos, &Bitmap::create())
-			.map_err(|e| ErrorKind::Other(e))?;
+			.map_err(ErrorKind::Other)?;
 		Ok(())
 	}
 
@@ -176,7 +176,9 @@ impl BitmapAccumulator {
 
 	/// The root hash of the bitmap accumulator MMR.
 	pub fn root(&self) -> Hash {
-		ReadonlyPMMR::at(&self.backend, self.backend.size()).root()
+		ReadonlyPMMR::at(&self.backend, self.backend.size())
+			.root()
+			.expect("no root, invalid tree")
 	}
 }
 
@@ -215,10 +217,10 @@ impl PMMRable for BitmapChunk {
 	fn as_elmt(&self) -> Self::E {
 		self.clone()
 	}
-}
 
-impl FixedLength for BitmapChunk {
-	const LEN: usize = Self::LEN_BYTES;
+	fn elmt_size() -> Option<u16> {
+		Some(Self::LEN_BYTES as u16)
+	}
 }
 
 impl DefaultHashable for BitmapChunk {}
@@ -233,7 +235,7 @@ impl Readable for BitmapChunk {
 	/// Reading is not currently supported, just return an empty one for now.
 	/// We store the underlying roaring bitmap externally for the bitmap accumulator
 	/// and the "hash only" backend means we never actually read these chunks.
-	fn read(_reader: &mut dyn Reader) -> Result<BitmapChunk, ser::Error> {
+	fn read<R: Reader>(_reader: &mut R) -> Result<BitmapChunk, ser::Error> {
 		Ok(BitmapChunk::new())
 	}
 }

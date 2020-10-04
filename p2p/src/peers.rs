@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 use crate::util::RwLock;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -73,7 +72,7 @@ impl Peers {
 		};
 		debug!("Saving newly connected peer {}.", peer_data.addr);
 		self.save_peer(&peer_data)?;
-		peers.insert(peer_data.addr, peer.clone());
+		peers.insert(peer_data.addr, peer);
 
 		Ok(())
 	}
@@ -149,7 +148,7 @@ impl Peers {
 				return None;
 			}
 		};
-		peers.get(&addr).map(|p| p.clone())
+		peers.get(&addr).cloned()
 	}
 
 	/// Number of peers currently connected to.
@@ -171,7 +170,7 @@ impl Peers {
 	// (total_difficulty) than we do.
 	pub fn more_work_peers(&self) -> Result<Vec<Arc<Peer>>, chain::Error> {
 		let peers = self.connected_peers();
-		if peers.len() == 0 {
+		if peers.is_empty() {
 			return Ok(vec![]);
 		}
 
@@ -190,7 +189,7 @@ impl Peers {
 	// (total_difficulty) than/as we do.
 	pub fn more_or_same_work_peers(&self) -> Result<usize, chain::Error> {
 		let peers = self.connected_peers();
-		if peers.len() == 0 {
+		if peers.is_empty() {
 			return Ok(0);
 		}
 
@@ -217,7 +216,7 @@ impl Peers {
 	/// branch, showing the highest total difficulty.
 	pub fn most_work_peers(&self) -> Vec<Arc<Peer>> {
 		let peers = self.connected_peers();
-		if peers.len() == 0 {
+		if peers.is_empty() {
 			return vec![];
 		}
 
@@ -265,7 +264,7 @@ impl Peers {
 				peers.remove(&peer.info.addr);
 				Ok(())
 			}
-			None => return Err(Error::PeerNotFound),
+			None => Err(Error::PeerNotFound),
 		}
 	}
 
@@ -275,9 +274,9 @@ impl Peers {
 		// check if peer exist
 		self.get_peer(peer_addr)?;
 		if self.is_banned(peer_addr) {
-			return self.update_state(peer_addr, State::Healthy);
+			self.update_state(peer_addr, State::Healthy)
 		} else {
-			return Err(Error::PeerNotBanned);
+			Err(Error::PeerNotBanned)
 		}
 	}
 
@@ -417,7 +416,12 @@ impl Peers {
 	/// Iterate over the peer list and prune all peers we have
 	/// lost connection to or have been deemed problematic.
 	/// Also avoid connected peer count getting too high.
-	pub fn clean_peers(&self, max_inbound_count: usize, max_outbound_count: usize) {
+	pub fn clean_peers(
+		&self,
+		max_inbound_count: usize,
+		max_outbound_count: usize,
+		preferred_peers: &[PeerAddr],
+	) {
 		let mut rm = vec![];
 
 		// build a list of peers to be cleaned up
@@ -465,12 +469,13 @@ impl Peers {
 		let excess_outgoing_count =
 			(self.peer_outbound_count() as usize).saturating_sub(max_outbound_count);
 		if excess_outgoing_count > 0 {
-			let mut addrs = self
+			let mut addrs: Vec<_> = self
 				.outgoing_connected_peers()
 				.iter()
+				.filter(|x| !preferred_peers.contains(&x.info.addr))
 				.take(excess_outgoing_count)
-				.map(|x| x.info.addr.clone())
-				.collect::<Vec<_>>();
+				.map(|x| x.info.addr)
+				.collect();
 			rm.append(&mut addrs);
 		}
 
@@ -478,12 +483,13 @@ impl Peers {
 		let excess_incoming_count =
 			(self.peer_inbound_count() as usize).saturating_sub(max_inbound_count);
 		if excess_incoming_count > 0 {
-			let mut addrs = self
+			let mut addrs: Vec<_> = self
 				.incoming_connected_peers()
 				.iter()
+				.filter(|x| !preferred_peers.contains(&x.info.addr))
 				.take(excess_incoming_count)
-				.map(|x| x.info.addr.clone())
-				.collect::<Vec<_>>();
+				.map(|x| x.info.addr)
+				.collect();
 			rm.append(&mut addrs);
 		}
 
@@ -668,16 +674,8 @@ impl ChainAdapter for Peers {
 		self.adapter.locate_headers(hs)
 	}
 
-	fn get_block(&self, h: Hash) -> Option<core::Block> {
-		self.adapter.get_block(h)
-	}
-
-	fn kernel_data_read(&self) -> Result<File, chain::Error> {
-		self.adapter.kernel_data_read()
-	}
-
-	fn kernel_data_write(&self, reader: &mut dyn Read) -> Result<bool, chain::Error> {
-		self.adapter.kernel_data_write(reader)
+	fn get_block(&self, h: Hash, peer_info: &PeerInfo) -> Option<core::Block> {
+		self.adapter.get_block(h, peer_info)
 	}
 
 	fn txhashset_read(&self, h: Hash) -> Option<TxHashSetRead> {

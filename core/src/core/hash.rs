@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,16 +17,11 @@
 //! Primary hash function used in the protocol
 //!
 
-use crate::ser::{
-	self, AsFixedBytes, Error, FixedLength, ProtocolVersion, Readable, Reader, Writeable, Writer,
-};
+use crate::ser::{self, Error, ProtocolVersion, Readable, Reader, Writeable, Writer};
 use blake2::blake2b::Blake2b;
 use byteorder::{BigEndian, ByteOrder};
-use std::cmp::min;
-use std::convert::AsRef;
-use std::ops::Add;
-use std::{fmt, ops};
-use util;
+use std::{cmp::min, convert::AsRef, fmt, ops};
+use util::ToHex;
 
 /// A hash consisting of all zeroes, used as a sentinel. No known preimage.
 pub const ZERO_HASH: Hash = Hash([0; 32]);
@@ -37,17 +32,6 @@ pub const ZERO_HASH: Hash = Hash([0; 32]);
 pub struct Hash([u8; 32]);
 
 impl DefaultHashable for Hash {}
-
-impl Hash {
-	fn hash_with<T: Writeable>(&self, other: T) -> Hash {
-		let mut hasher = HashWriter::default();
-		ser::Writeable::write(self, &mut hasher).unwrap();
-		ser::Writeable::write(&other, &mut hasher).unwrap();
-		let mut ret = [0; 32];
-		hasher.finalize(&mut ret);
-		Hash(ret)
-	}
-}
 
 impl fmt::Debug for Hash {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,12 +48,10 @@ impl fmt::Display for Hash {
 	}
 }
 
-impl FixedLength for Hash {
-	/// Size of a hash in bytes.
-	const LEN: usize = 32;
-}
-
 impl Hash {
+	/// A hash is 32 bytes.
+	pub const LEN: usize = 32;
+
 	/// Builds a Hash from a byte vector. If the vector is too short, it will be
 	/// completed by zeroes. If it's too long, it will be truncated.
 	pub fn from_vec(v: &[u8]) -> Hash {
@@ -89,14 +71,9 @@ impl Hash {
 		&self.0
 	}
 
-	/// Convert a hash to hex string format.
-	pub fn to_hex(&self) -> String {
-		util::to_hex(self.to_vec())
-	}
-
 	/// Convert hex string back to hash.
 	pub fn from_hex(hex: &str) -> Result<Hash, Error> {
-		let bytes = util::from_hex(hex.to_string())
+		let bytes = util::from_hex(hex)
 			.map_err(|_| Error::HexError(format!("failed to decode {}", hex)))?;
 		Ok(Hash::from_vec(&bytes))
 	}
@@ -154,7 +131,7 @@ impl AsRef<[u8]> for Hash {
 }
 
 impl Readable for Hash {
-	fn read(reader: &mut dyn Reader) -> Result<Hash, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<Hash, ser::Error> {
 		let v = reader.read_fixed_bytes(32)?;
 		let mut a = [0; 32];
 		a.copy_from_slice(&v[..]);
@@ -165,13 +142,6 @@ impl Readable for Hash {
 impl Writeable for Hash {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
 		writer.write_fixed_bytes(&self.0)
-	}
-}
-
-impl Add for Hash {
-	type Output = Hash;
-	fn add(self, other: Hash) -> Hash {
-		self.hash_with(other)
 	}
 }
 
@@ -215,8 +185,8 @@ impl ser::Writer for HashWriter {
 		ser::SerializationMode::Hash
 	}
 
-	fn write_fixed_bytes<T: AsFixedBytes>(&mut self, b32: &T) -> Result<(), ser::Error> {
-		self.state.update(b32.as_ref());
+	fn write_fixed_bytes<T: AsRef<[u8]>>(&mut self, bytes: T) -> Result<(), ser::Error> {
+		self.state.update(bytes.as_ref());
 		Ok(())
 	}
 
@@ -234,6 +204,7 @@ pub trait Hashed {
 /// Implementing this trait enables the default
 /// hash implementation
 pub trait DefaultHashable: Writeable {}
+
 impl<D: DefaultHashable> Hashed for D {
 	fn hash(&self) -> Hash {
 		let mut hasher = HashWriter::default();

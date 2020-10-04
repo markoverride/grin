@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::util::RwLock;
 use std::convert::From;
+use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::prelude::*;
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+use grin_store;
 
 use crate::chain;
 use crate::core::core;
@@ -28,7 +33,8 @@ use crate::core::core::hash::Hash;
 use crate::core::global;
 use crate::core::pow::Difficulty;
 use crate::core::ser::{self, ProtocolVersion, Readable, Reader, Writeable, Writer};
-use grin_store;
+use crate::msg::PeerAddrs;
+use crate::util::RwLock;
 
 /// Maximum number of block headers a peer should ever send
 pub const MAX_BLOCK_HEADERS: u32 = 512;
@@ -65,6 +71,7 @@ pub enum Error {
 	Connection(io::Error),
 	/// Header type does not match the expected message type
 	BadMessage,
+	UnexpectedMessage,
 	MsgLen,
 	Banned,
 	ConnectionClose,
@@ -132,7 +139,7 @@ impl Writeable for PeerAddr {
 }
 
 impl Readable for PeerAddr {
-	fn read(reader: &mut dyn Reader) -> Result<PeerAddr, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<PeerAddr, ser::Error> {
 		let v4_or_v6 = reader.read_u8()?;
 		if v4_or_v6 == 0 {
 			let ip = reader.read_fixed_bytes(4)?;
@@ -143,14 +150,55 @@ impl Readable for PeerAddr {
 			))))
 		} else {
 			let ip = try_iter_map_vec!(0..8, |_| reader.read_u16());
+			let ipv6 = Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
 			let port = reader.read_u16()?;
-			Ok(PeerAddr(SocketAddr::V6(SocketAddrV6::new(
-				Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]),
-				port,
-				0,
-				0,
-			))))
+			if let Some(ipv4) = ipv6.to_ipv4() {
+				Ok(PeerAddr(SocketAddr::V4(SocketAddrV4::new(ipv4, port))))
+			} else {
+				Ok(PeerAddr(SocketAddr::V6(SocketAddrV6::new(
+					ipv6, port, 0, 0,
+				))))
+			}
 		}
+	}
+}
+
+impl<'de> Visitor<'de> for PeerAddrs {
+	type Value = PeerAddrs;
+
+	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+		formatter.write_str("an array of dns names or IP addresses")
+	}
+
+	fn visit_seq<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+	where
+		M: SeqAccess<'de>,
+	{
+		let mut peers = Vec::with_capacity(access.size_hint().unwrap_or(0));
+
+		while let Some(entry) = access.next_element::<&str>()? {
+			match SocketAddr::from_str(entry) {
+				// Try to parse IP address first
+				Ok(ip) => peers.push(PeerAddr(ip)),
+				// If that fails it's probably a DNS record
+				Err(_) => {
+					let socket_addrs = entry.to_socket_addrs().map_err(|_| {
+						serde::de::Error::custom(format!("Unable to resolve DNS: {}", entry))
+					})?;
+					peers.append(&mut socket_addrs.map(PeerAddr).collect());
+				}
+			}
+		}
+		Ok(PeerAddrs { peers })
+	}
+}
+
+impl<'de> Deserialize<'de> for PeerAddrs {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		deserializer.deserialize_seq(PeerAddrs { peers: vec![] })
 	}
 }
 
@@ -216,18 +264,18 @@ pub struct P2PConfig {
 	pub seeding_type: Seeding,
 
 	/// The list of seed nodes, if using Seeding as a seed type
-	pub seeds: Option<Vec<PeerAddr>>,
+	pub seeds: Option<PeerAddrs>,
 
 	/// Capabilities expose by this node, also conditions which other peers this
 	/// node will have an affinity toward when connection.
 	pub capabilities: Capabilities,
 
-	pub peers_allow: Option<Vec<PeerAddr>>,
+	pub peers_allow: Option<PeerAddrs>,
 
-	pub peers_deny: Option<Vec<PeerAddr>>,
+	pub peers_deny: Option<PeerAddrs>,
 
 	/// The list of preferred peers that we will try to connect to
-	pub peers_preferred: Option<Vec<PeerAddr>>,
+	pub peers_preferred: Option<PeerAddrs>,
 
 	pub ban_window: Option<i64>,
 
@@ -314,7 +362,7 @@ impl P2PConfig {
 pub enum Seeding {
 	/// No seeding, mostly for tests that programmatically connect
 	None,
-	/// A list of seed addresses provided to the server
+	/// A list of seeds provided to the server (can be addresses or DNS names)
 	List,
 	/// Automatically get a list of seeds from multiple DNS
 	DNSSeed,
@@ -333,17 +381,17 @@ bitflags! {
 	#[derive(Serialize, Deserialize)]
 	pub struct Capabilities: u32 {
 		/// We don't know (yet) what the peer can do.
-		const UNKNOWN = 0b00000000;
+		const UNKNOWN = 0b0000_0000;
 		/// Can provide full history of headers back to genesis
 		/// (for at least one arbitrary fork).
-		const HEADER_HIST = 0b00000001;
+		const HEADER_HIST = 0b0000_0001;
 		/// Can provide block headers and the TxHashSet for some recent-enough
 		/// height.
-		const TXHASHSET_HIST = 0b00000010;
+		const TXHASHSET_HIST = 0b0000_0010;
 		/// Can provide a list of healthy peers
-		const PEER_LIST = 0b00000100;
+		const PEER_LIST = 0b0000_0100;
 		/// Can broadcast and request txs by kernel hash.
-		const TX_KERNEL_HASH = 0b00001000;
+		const TX_KERNEL_HASH = 0b0000_1000;
 
 		/// All nodes right now are "full nodes".
 		/// Some nodes internally may maintain longer block histories (archival_mode)
@@ -470,11 +518,11 @@ pub struct PeerInfoDisplay {
 impl From<PeerInfo> for PeerInfoDisplay {
 	fn from(info: PeerInfo) -> PeerInfoDisplay {
 		PeerInfoDisplay {
-			capabilities: info.capabilities.clone(),
+			capabilities: info.capabilities,
 			user_agent: info.user_agent.clone(),
 			version: info.version,
-			addr: info.addr.clone(),
-			direction: info.direction.clone(),
+			addr: info.addr,
+			direction: info.direction,
 			total_difficulty: info.total_difficulty(),
 			height: info.height(),
 		}
@@ -552,11 +600,8 @@ pub trait ChainAdapter: Sync + Send {
 	fn locate_headers(&self, locator: &[Hash]) -> Result<Vec<core::BlockHeader>, chain::Error>;
 
 	/// Gets a full block by its hash.
-	fn get_block(&self, h: Hash) -> Option<core::Block>;
-
-	fn kernel_data_read(&self) -> Result<File, chain::Error>;
-
-	fn kernel_data_write(&self, reader: &mut dyn Read) -> Result<bool, chain::Error>;
+	/// Converts block to v2 compatibility if necessary (based on peer protocol version).
+	fn get_block(&self, h: Hash, peer_info: &PeerInfo) -> Option<core::Block>;
 
 	/// Provides a reading view into the current txhashset state as well as
 	/// the required indexes for a consumer to rewind to a consistant state
@@ -614,4 +659,20 @@ pub trait NetAdapter: ChainAdapter {
 
 	/// Is this peer currently banned?
 	fn is_banned(&self, addr: PeerAddr) -> bool;
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachmentMeta {
+	pub size: usize,
+	pub hash: Hash,
+	pub height: u64,
+	pub start_time: DateTime<Utc>,
+	pub path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachmentUpdate {
+	pub read: usize,
+	pub left: usize,
+	pub meta: Arc<AttachmentMeta>,
 }

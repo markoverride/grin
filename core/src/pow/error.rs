@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,9 +29,6 @@ pub enum ErrorKind {
 	/// Verification error
 	#[fail(display = "Verification Error: {}", _0)]
 	Verification(String),
-	/// Failure to cast from/to generic integer type
-	#[fail(display = "IntegerCast")]
-	IntegerCast,
 	/// IO Error
 	#[fail(display = "IO Error")]
 	IOError,
@@ -86,14 +83,6 @@ impl From<ErrorKind> for Error {
 impl From<Context<ErrorKind>> for Error {
 	fn from(inner: Context<ErrorKind>) -> Error {
 		Error { inner }
-	}
-}
-
-impl From<fmt::Error> for Error {
-	fn from(_error: fmt::Error) -> Error {
-		Error {
-			inner: Context::new(ErrorKind::IntegerCast),
-		}
 	}
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,13 @@
 //! John Tromp. Ported to Rust from https://github.com/tromp/cuckoo.
 //!
 //! Cuckaroom is a variation of Cuckaroo that's tweaked at the second HardFork
-//! to maintain ASIC-Resistance, as introduced in
-//! https://www.grin-forum.org/t/mid-december-pow-hardfork-cuckarood29-cuckaroom29
+//! to maintain ASIC-Resistance.
 //! It uses a tweaked edge block generation where states are xored with all later
 //! states, reverts to standard siphash, and most importantly, identifies cycles
 //! in a mono-partite graph, from which it derives the letter 'm'.
 
 use crate::global;
-use crate::pow::common::{CuckooParams, EdgeType};
+use crate::pow::common::CuckooParams;
 use crate::pow::error::{Error, ErrorKind};
 use crate::pow::siphash::siphash_block;
 use crate::pow::{PoWContext, Proof};
@@ -31,29 +30,17 @@ use crate::pow::{PoWContext, Proof};
 /// Instantiate a new CuckaroomContext as a PowContext. Note that this can't
 /// be moved in the PoWContext trait as this particular trait needs to be
 /// convertible to an object trait.
-pub fn new_cuckaroom_ctx<T>(
-	edge_bits: u8,
-	proof_size: usize,
-) -> Result<Box<dyn PoWContext<T>>, Error>
-where
-	T: EdgeType + 'static,
-{
-	let params = CuckooParams::new(edge_bits, proof_size)?;
+pub fn new_cuckaroom_ctx(edge_bits: u8, proof_size: usize) -> Result<Box<dyn PoWContext>, Error> {
+	let params = CuckooParams::new(edge_bits, edge_bits, proof_size)?;
 	Ok(Box::new(CuckaroomContext { params }))
 }
 
 /// Cuckaroom cycle context. Only includes the verifier for now.
-pub struct CuckaroomContext<T>
-where
-	T: EdgeType,
-{
-	params: CuckooParams<T>,
+pub struct CuckaroomContext {
+	params: CuckooParams,
 }
 
-impl<T> PoWContext<T> for CuckaroomContext<T>
-where
-	T: EdgeType,
-{
+impl PoWContext for CuckaroomContext {
 	fn set_header_nonce(
 		&mut self,
 		header: Vec<u8>,
@@ -70,35 +57,30 @@ where
 	fn verify(&self, proof: &Proof) -> Result<(), Error> {
 		let proofsize = proof.proof_size();
 		if proofsize != global::proofsize() {
-			return Err(ErrorKind::Verification("wrong cycle length".to_owned()))?;
+			return Err(ErrorKind::Verification("wrong cycle length".to_owned()).into());
 		}
 		let nonces = &proof.nonces;
-		let mut from = vec![0u32; proofsize];
-		let mut to = vec![0u32; proofsize];
-		let mut xor_from: u32 = 0;
-		let mut xor_to: u32 = 0;
-		let nodemask = self.params.edge_mask >> 1;
+		let mut from = vec![0u64; proofsize];
+		let mut to = vec![0u64; proofsize];
+		let mut xor_from: u64 = 0;
+		let mut xor_to: u64 = 0;
 
 		for n in 0..proofsize {
-			if nonces[n] > to_u64!(self.params.edge_mask) {
-				return Err(ErrorKind::Verification("edge too big".to_owned()))?;
+			if nonces[n] > self.params.edge_mask {
+				return Err(ErrorKind::Verification("edge too big".to_owned()).into());
 			}
 			if n > 0 && nonces[n] <= nonces[n - 1] {
-				return Err(ErrorKind::Verification("edges not ascending".to_owned()))?;
+				return Err(ErrorKind::Verification("edges not ascending".to_owned()).into());
 			}
-			let edge = to_edge!(
-				T,
-				siphash_block(&self.params.siphash_keys, nonces[n], 21, true)
-			);
-			from[n] = to_u32!(edge & nodemask);
+			// 21 is standard siphash rotation constant
+			let edge: u64 = siphash_block(&self.params.siphash_keys, nonces[n], 21, true);
+			from[n] = edge & self.params.node_mask;
 			xor_from ^= from[n];
-			to[n] = to_u32!((edge >> 32) & nodemask);
+			to[n] = (edge >> 32) & self.params.node_mask;
 			xor_to ^= to[n];
 		}
 		if xor_from != xor_to {
-			return Err(ErrorKind::Verification(
-				"endpoints don't match up".to_owned(),
-			))?;
+			return Err(ErrorKind::Verification("endpoints don't match up".to_owned()).into());
 		}
 		let mut visited = vec![false; proofsize];
 		let mut n = 0;
@@ -106,14 +88,14 @@ where
 		loop {
 			// follow cycle
 			if visited[i] {
-				return Err(ErrorKind::Verification("branch in cycle".to_owned()))?;
+				return Err(ErrorKind::Verification("branch in cycle".to_owned()).into());
 			}
 			visited[i] = true;
 			let mut nexti = 0;
 			while from[nexti] != to[i] {
 				nexti += 1;
 				if nexti == proofsize {
-					return Err(ErrorKind::Verification("cycle dead ends".to_owned()))?;
+					return Err(ErrorKind::Verification("cycle dead ends".to_owned()).into());
 				}
 			}
 			i = nexti;
@@ -126,7 +108,7 @@ where
 		if n == proofsize {
 			Ok(())
 		} else {
-			Err(ErrorKind::Verification("cycle too short".to_owned()))?
+			Err(ErrorKind::Verification("cycle too short".to_owned()).into())
 		}
 	}
 }
@@ -168,25 +150,19 @@ mod test {
 
 	#[test]
 	fn cuckaroom19_29_vectors() {
-		let mut ctx19 = new_impl::<u64>(19, 42);
-		ctx19.params.siphash_keys = V1_19_HASH.clone();
-		assert!(ctx19
-			.verify(&Proof::new(V1_19_SOL.to_vec().clone()))
-			.is_ok());
+		global::set_local_chain_type(global::ChainTypes::Mainnet);
+		let mut ctx19 = new_impl(19, 42);
+		ctx19.params.siphash_keys = V1_19_HASH;
+		assert!(ctx19.verify(&Proof::new(V1_19_SOL.to_vec())).is_ok());
 		assert!(ctx19.verify(&Proof::zero(42)).is_err());
-		let mut ctx29 = new_impl::<u64>(29, 42);
-		ctx29.params.siphash_keys = V2_29_HASH.clone();
-		assert!(ctx29
-			.verify(&Proof::new(V2_29_SOL.to_vec().clone()))
-			.is_ok());
+		let mut ctx29 = new_impl(29, 42);
+		ctx29.params.siphash_keys = V2_29_HASH;
+		assert!(ctx29.verify(&Proof::new(V2_29_SOL.to_vec())).is_ok());
 		assert!(ctx29.verify(&Proof::zero(42)).is_err());
 	}
 
-	fn new_impl<T>(edge_bits: u8, proof_size: usize) -> CuckaroomContext<T>
-	where
-		T: EdgeType,
-	{
-		let params = CuckooParams::new(edge_bits, proof_size).unwrap();
+	fn new_impl(edge_bits: u8, proof_size: usize) -> CuckaroomContext {
+		let params = CuckooParams::new(edge_bits, edge_bits, proof_size).unwrap();
 		CuckaroomContext { params }
 	}
 }

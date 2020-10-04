@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,11 +22,12 @@
 use crate::core::hash::{DefaultHashable, Hash, Hashed};
 use crate::global::PROTOCOL_VERSION;
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
+use bytes::Buf;
 use keychain::{BlindingFactor, Identifier, IDENTIFIER_SIZE};
+use std::convert::TryInto;
 use std::fmt::{self, Debug};
 use std::io::{self, Read, Write};
-use std::marker;
-use std::{cmp, error};
+use std::{cmp, error, marker};
 use util::secp::constants::{
 	AGG_SIGNATURE_SIZE, COMPRESSED_PUBLIC_KEY_SIZE, MAX_PROOF_SIZE, PEDERSEN_COMMITMENT_SIZE,
 	SECRET_KEY_SIZE,
@@ -69,11 +70,19 @@ pub enum Error {
 	DuplicateError,
 	/// Block header version (hard-fork schedule).
 	InvalidBlockVersion,
+	/// Unsupported protocol version
+	UnsupportedProtocolVersion,
 }
 
 impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
 		Error::IOErr(format!("{}", e), e.kind())
+	}
+}
+
+impl From<io::ErrorKind> for Error {
+	fn from(e: io::ErrorKind) -> Error {
+		Error::IOErr(format!("{}", io::Error::from(e)), e)
 	}
 }
 
@@ -92,6 +101,7 @@ impl fmt::Display for Error {
 			Error::TooLargeReadErr => f.write_str("too large read"),
 			Error::HexError(ref e) => write!(f, "hex error {:?}", e),
 			Error::InvalidBlockVersion => f.write_str("invalid block version"),
+			Error::UnsupportedProtocolVersion => f.write_str("unsupported protocol version"),
 		}
 	}
 }
@@ -115,6 +125,7 @@ impl error::Error for Error {
 			Error::TooLargeReadErr => "too large read",
 			Error::HexError(_) => "hex error",
 			Error::InvalidBlockVersion => "invalid block version",
+			Error::UnsupportedProtocolVersion => "unsupported protocol version",
 		}
 	}
 }
@@ -126,6 +137,16 @@ pub enum SerializationMode {
 	Full,
 	/// Serialize the data that defines the object
 	Hash,
+}
+
+impl SerializationMode {
+	/// Hash mode?
+	pub fn is_hash_mode(&self) -> bool {
+		match self {
+			SerializationMode::Hash => true,
+			_ => false,
+		}
+	}
 }
 
 /// Implementations defined how different numbers and binary structures are
@@ -179,14 +200,18 @@ pub trait Writer {
 
 	/// Writes a variable number of bytes. The length is encoded as a 64-bit
 	/// prefix.
-	fn write_bytes<T: AsFixedBytes>(&mut self, bytes: &T) -> Result<(), Error> {
+	fn write_bytes<T: AsRef<[u8]>>(&mut self, bytes: T) -> Result<(), Error> {
 		self.write_u64(bytes.as_ref().len() as u64)?;
 		self.write_fixed_bytes(bytes)
 	}
 
-	/// Writes a fixed number of bytes from something that can turn itself into
-	/// a `&[u8]`. The reader is expected to know the actual length on read.
-	fn write_fixed_bytes<T: AsFixedBytes>(&mut self, fixed: &T) -> Result<(), Error>;
+	/// Writes a fixed number of bytes. The reader is expected to know the actual length on read.
+	fn write_fixed_bytes<T: AsRef<[u8]>>(&mut self, bytes: T) -> Result<(), Error>;
+
+	/// Writes a fixed length of "empty" bytes.
+	fn write_empty_bytes(&mut self, length: usize) -> Result<(), Error> {
+		self.write_fixed_bytes(vec![0u8; length])
+	}
 }
 
 /// Implementations defined how different numbers and binary structures are
@@ -214,6 +239,17 @@ pub trait Reader {
 	/// Access to underlying protocol version to support
 	/// version specific deserialization logic.
 	fn protocol_version(&self) -> ProtocolVersion;
+
+	/// Read a fixed number of "empty" bytes from the underlying reader.
+	/// It is an error if any non-empty bytes encountered.
+	fn read_empty_bytes(&mut self, length: usize) -> Result<(), Error> {
+		for _ in 0..length {
+			if self.read_u8()? != 0u8 {
+				return Err(Error::CorruptedData);
+			}
+		}
+		Ok(())
+	}
 }
 
 /// Trait that every type that can be serialized as binary must implement.
@@ -225,17 +261,17 @@ pub trait Writeable {
 }
 
 /// Reader that exposes an Iterator interface.
-pub struct IteratingReader<'a, T> {
+pub struct IteratingReader<'a, T, R: Reader> {
 	count: u64,
 	curr: u64,
-	reader: &'a mut dyn Reader,
+	reader: &'a mut R,
 	_marker: marker::PhantomData<T>,
 }
 
-impl<'a, T> IteratingReader<'a, T> {
+impl<'a, T, R: Reader> IteratingReader<'a, T, R> {
 	/// Constructor to create a new iterating reader for the provided underlying reader.
 	/// Takes a count so we know how many to iterate over.
-	pub fn new(reader: &'a mut dyn Reader, count: u64) -> IteratingReader<'a, T> {
+	pub fn new(reader: &'a mut R, count: u64) -> Self {
 		let curr = 0;
 		IteratingReader {
 			count,
@@ -246,9 +282,10 @@ impl<'a, T> IteratingReader<'a, T> {
 	}
 }
 
-impl<'a, T> Iterator for IteratingReader<'a, T>
+impl<'a, T, R> Iterator for IteratingReader<'a, T, R>
 where
 	T: Readable,
+	R: Reader,
 {
 	type Item = T;
 
@@ -262,9 +299,10 @@ where
 }
 
 /// Reads multiple serialized items into a Vec.
-pub fn read_multi<T>(reader: &mut dyn Reader, count: u64) -> Result<Vec<T>, Error>
+pub fn read_multi<T, R>(reader: &mut R, count: u64) -> Result<Vec<T>, Error>
 where
 	T: Readable,
+	R: Reader,
 {
 	// Very rudimentary check to ensure we do not overflow anything
 	// attempting to read huge amounts of data.
@@ -293,7 +331,7 @@ impl ProtocolVersion {
 	pub const MAX: u32 = std::u32::MAX;
 
 	/// Protocol version as u32 to allow for convenient exhaustive matching on values.
-	pub fn value(&self) -> u32 {
+	pub fn value(self) -> u32 {
 		self.0
 	}
 
@@ -302,7 +340,7 @@ impl ProtocolVersion {
 	/// negotiation in the p2p layer. Connected peers will negotiate a suitable
 	/// protocol version for serialization/deserialization of p2p messages.
 	pub fn local() -> ProtocolVersion {
-		ProtocolVersion(PROTOCOL_VERSION)
+		PROTOCOL_VERSION
 	}
 
 	/// We need to specify a protocol version for our local database.
@@ -332,7 +370,7 @@ impl Writeable for ProtocolVersion {
 }
 
 impl Readable for ProtocolVersion {
-	fn read(reader: &mut dyn Reader) -> Result<ProtocolVersion, Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<ProtocolVersion, Error> {
 		let version = reader.read_u32()?;
 		Ok(ProtocolVersion(version))
 	}
@@ -346,12 +384,12 @@ where
 	Self: Sized,
 {
 	/// Reads the data necessary to this Readable from the provided reader
-	fn read(reader: &mut dyn Reader) -> Result<Self, Error>;
+	fn read<R: Reader>(reader: &mut R) -> Result<Self, Error>;
 }
 
 /// Deserializes a Readable from any std::io::Read implementation.
-pub fn deserialize<T: Readable>(
-	source: &mut dyn Read,
+pub fn deserialize<T: Readable, R: Read>(
+	source: &mut R,
 	version: ProtocolVersion,
 ) -> Result<T, Error> {
 	let mut reader = BinReader::new(source, version);
@@ -359,7 +397,7 @@ pub fn deserialize<T: Readable>(
 }
 
 /// Deserialize a Readable based on our default "local" protocol version.
-pub fn deserialize_default<T: Readable>(source: &mut dyn Read) -> Result<T, Error> {
+pub fn deserialize_default<T: Readable, R: Read>(source: &mut R) -> Result<T, Error> {
 	deserialize(source, ProtocolVersion::local())
 }
 
@@ -387,14 +425,14 @@ pub fn ser_vec<W: Writeable>(thing: &W, version: ProtocolVersion) -> Result<Vec<
 }
 
 /// Utility to read from a binary source
-pub struct BinReader<'a> {
-	source: &'a mut dyn Read,
+pub struct BinReader<'a, R: Read> {
+	source: &'a mut R,
 	version: ProtocolVersion,
 }
 
-impl<'a> BinReader<'a> {
+impl<'a, R: Read> BinReader<'a, R> {
 	/// Constructor for a new BinReader for the provided source and protocol version.
-	pub fn new(source: &'a mut dyn Read, version: ProtocolVersion) -> BinReader<'a> {
+	pub fn new(source: &'a mut R, version: ProtocolVersion) -> Self {
 		BinReader { source, version }
 	}
 }
@@ -405,7 +443,7 @@ fn map_io_err(err: io::Error) -> Error {
 
 /// Utility wrapper for an underlying byte Reader. Defines higher level methods
 /// to read numbers, byte vectors, hashes, etc.
-impl<'a> Reader for BinReader<'a> {
+impl<'a, R: Read> Reader for BinReader<'a, R> {
 	fn read_u8(&mut self) -> Result<u8, Error> {
 		self.source.read_u8().map_err(map_io_err)
 	}
@@ -544,8 +582,111 @@ impl<'a> Reader for StreamingReader<'a> {
 	}
 }
 
+/// Protocol version-aware wrapper around a `Buf` impl
+pub struct BufReader<'a, B: Buf> {
+	inner: &'a mut B,
+	version: ProtocolVersion,
+	bytes_read: usize,
+}
+
+impl<'a, B: Buf> BufReader<'a, B> {
+	/// Construct a new BufReader
+	pub fn new(buf: &'a mut B, version: ProtocolVersion) -> Self {
+		Self {
+			inner: buf,
+			version,
+			bytes_read: 0,
+		}
+	}
+
+	/// Check whether the buffer has enough bytes remaining to perform a read
+	fn has_remaining(&mut self, len: usize) -> Result<(), Error> {
+		if self.inner.remaining() >= len {
+			self.bytes_read += len;
+			Ok(())
+		} else {
+			Err(io::ErrorKind::UnexpectedEof.into())
+		}
+	}
+
+	/// The total bytes read
+	pub fn bytes_read(&self) -> u64 {
+		self.bytes_read as u64
+	}
+
+	/// Convenience function to read from the buffer and deserialize
+	pub fn body<T: Readable>(&mut self) -> Result<T, Error> {
+		T::read(self)
+	}
+}
+
+impl<'a, B: Buf> Reader for BufReader<'a, B> {
+	fn read_u8(&mut self) -> Result<u8, Error> {
+		self.has_remaining(1)?;
+		Ok(self.inner.get_u8())
+	}
+
+	fn read_u16(&mut self) -> Result<u16, Error> {
+		self.has_remaining(2)?;
+		Ok(self.inner.get_u16())
+	}
+
+	fn read_u32(&mut self) -> Result<u32, Error> {
+		self.has_remaining(4)?;
+		Ok(self.inner.get_u32())
+	}
+
+	fn read_u64(&mut self) -> Result<u64, Error> {
+		self.has_remaining(8)?;
+		Ok(self.inner.get_u64())
+	}
+
+	fn read_i32(&mut self) -> Result<i32, Error> {
+		self.has_remaining(4)?;
+		Ok(self.inner.get_i32())
+	}
+
+	fn read_i64(&mut self) -> Result<i64, Error> {
+		self.has_remaining(8)?;
+		Ok(self.inner.get_i64())
+	}
+
+	fn read_bytes_len_prefix(&mut self) -> Result<Vec<u8>, Error> {
+		let len = self.read_u64()?;
+		self.read_fixed_bytes(len as usize)
+	}
+
+	fn read_fixed_bytes(&mut self, len: usize) -> Result<Vec<u8>, Error> {
+		// not reading more than 100k bytes in a single read
+		if len > 100_000 {
+			return Err(Error::TooLargeReadErr);
+		}
+		self.has_remaining(len)?;
+
+		let mut buf = vec![0; len];
+		self.inner.copy_to_slice(&mut buf[..]);
+		Ok(buf)
+	}
+
+	fn expect_u8(&mut self, val: u8) -> Result<u8, Error> {
+		let b = self.read_u8()?;
+		if b == val {
+			Ok(b)
+		} else {
+			Err(Error::UnexpectedData {
+				expected: vec![val],
+				received: vec![b],
+			})
+		}
+	}
+
+	fn protocol_version(&self) -> ProtocolVersion {
+		self.version
+	}
+}
+
 impl Readable for Commitment {
-	fn read(reader: &mut dyn Reader) -> Result<Commitment, Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<Commitment, Error> {
 		let a = reader.read_fixed_bytes(PEDERSEN_COMMITMENT_SIZE)?;
 		let mut c = [0; PEDERSEN_COMMITMENT_SIZE];
 		c[..PEDERSEN_COMMITMENT_SIZE].clone_from_slice(&a[..PEDERSEN_COMMITMENT_SIZE]);
@@ -566,14 +707,10 @@ impl Writeable for BlindingFactor {
 }
 
 impl Readable for BlindingFactor {
-	fn read(reader: &mut dyn Reader) -> Result<BlindingFactor, Error> {
-		let bytes = reader.read_fixed_bytes(BlindingFactor::LEN)?;
+	fn read<R: Reader>(reader: &mut R) -> Result<BlindingFactor, Error> {
+		let bytes = reader.read_fixed_bytes(SECRET_KEY_SIZE)?;
 		Ok(BlindingFactor::from_slice(&bytes))
 	}
-}
-
-impl FixedLength for BlindingFactor {
-	const LEN: usize = SECRET_KEY_SIZE;
 }
 
 impl Writeable for Identifier {
@@ -583,7 +720,7 @@ impl Writeable for Identifier {
 }
 
 impl Readable for Identifier {
-	fn read(reader: &mut dyn Reader) -> Result<Identifier, Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<Identifier, Error> {
 		let bytes = reader.read_fixed_bytes(IDENTIFIER_SIZE)?;
 		Ok(Identifier::from_bytes(&bytes))
 	}
@@ -596,7 +733,7 @@ impl Writeable for RangeProof {
 }
 
 impl Readable for RangeProof {
-	fn read(reader: &mut dyn Reader) -> Result<RangeProof, Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<RangeProof, Error> {
 		let len = reader.read_u64()?;
 		let max_len = cmp::min(len as usize, MAX_PROOF_SIZE);
 		let p = reader.read_fixed_bytes(max_len)?;
@@ -609,24 +746,24 @@ impl Readable for RangeProof {
 	}
 }
 
-impl FixedLength for RangeProof {
-	const LEN: usize = 8 // length prefix
-		+ MAX_PROOF_SIZE;
-}
-
 impl PMMRable for RangeProof {
 	type E = Self;
 
 	fn as_elmt(&self) -> Self::E {
-		self.clone()
+		*self
+	}
+
+	// Size is length prefix (8 bytes for u64) + MAX_PROOF_SIZE.
+	fn elmt_size() -> Option<u16> {
+		Some((8 + MAX_PROOF_SIZE).try_into().unwrap())
 	}
 }
 
 impl Readable for Signature {
-	fn read(reader: &mut dyn Reader) -> Result<Signature, Error> {
-		let a = reader.read_fixed_bytes(Signature::LEN)?;
-		let mut c = [0; Signature::LEN];
-		c[..Signature::LEN].clone_from_slice(&a[..Signature::LEN]);
+	fn read<R: Reader>(reader: &mut R) -> Result<Signature, Error> {
+		let a = reader.read_fixed_bytes(AGG_SIGNATURE_SIZE)?;
+		let mut c = [0; AGG_SIGNATURE_SIZE];
+		c[..AGG_SIGNATURE_SIZE].clone_from_slice(&a[..AGG_SIGNATURE_SIZE]);
 		Ok(Signature::from_raw_data(&c).unwrap())
 	}
 }
@@ -637,27 +774,19 @@ impl Writeable for Signature {
 	}
 }
 
-impl FixedLength for Signature {
-	const LEN: usize = AGG_SIGNATURE_SIZE;
-}
-
-impl FixedLength for PublicKey {
-	const LEN: usize = COMPRESSED_PUBLIC_KEY_SIZE;
-}
-
 impl Writeable for PublicKey {
 	// Write the public key in compressed form
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
 		let secp = Secp256k1::with_caps(ContextFlag::None);
-		writer.write_fixed_bytes(&self.serialize_vec(&secp, true).as_ref())?;
+		writer.write_fixed_bytes(self.serialize_vec(&secp, true))?;
 		Ok(())
 	}
 }
 
 impl Readable for PublicKey {
 	// Read the public key in compressed form
-	fn read(reader: &mut dyn Reader) -> Result<Self, Error> {
-		let buf = reader.read_fixed_bytes(PublicKey::LEN)?;
+	fn read<R: Reader>(reader: &mut R) -> Result<Self, Error> {
+		let buf = reader.read_fixed_bytes(COMPRESSED_PUBLIC_KEY_SIZE)?;
 		let secp = Secp256k1::with_caps(ContextFlag::None);
 		let pk = PublicKey::from_slice(&secp, &buf).map_err(|_| Error::CorruptedData)?;
 		Ok(pk)
@@ -670,11 +799,9 @@ pub trait VerifySortedAndUnique<T> {
 	fn verify_sorted_and_unique(&self) -> Result<(), Error>;
 }
 
-impl<T: Hashed> VerifySortedAndUnique<T> for Vec<T> {
+impl<T: Ord> VerifySortedAndUnique<T> for Vec<T> {
 	fn verify_sorted_and_unique(&self) -> Result<(), Error> {
-		let hashes = self.iter().map(|item| item.hash()).collect::<Vec<_>>();
-		let pairs = hashes.windows(2);
-		for pair in pairs {
+		for pair in self.windows(2) {
 			if pair[0] > pair[1] {
 				return Err(Error::SortError);
 			} else if pair[0] == pair[1] {
@@ -709,9 +836,8 @@ impl<'a> Writer for BinWriter<'a> {
 		SerializationMode::Full
 	}
 
-	fn write_fixed_bytes<T: AsFixedBytes>(&mut self, fixed: &T) -> Result<(), Error> {
-		let bs = fixed.as_ref();
-		self.sink.write_all(bs)?;
+	fn write_fixed_bytes<T: AsRef<[u8]>>(&mut self, bytes: T) -> Result<(), Error> {
+		self.sink.write_all(bytes.as_ref())?;
 		Ok(())
 	}
 
@@ -729,7 +855,7 @@ macro_rules! impl_int {
 		}
 
 		impl Readable for $int {
-			fn read(reader: &mut dyn Reader) -> Result<$int, Error> {
+			fn read<R: Reader>(reader: &mut R) -> Result<$int, Error> {
 				reader.$r_fn()
 			}
 		}
@@ -747,7 +873,7 @@ impl<T> Readable for Vec<T>
 where
 	T: Readable,
 {
-	fn read(reader: &mut dyn Reader) -> Result<Vec<T>, Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<Vec<T>, Error> {
 		let mut buf = Vec::new();
 		loop {
 			let elem = T::read(reader);
@@ -789,7 +915,7 @@ impl<A: Writeable, B: Writeable> Writeable for (A, B) {
 }
 
 impl<A: Readable, B: Readable> Readable for (A, B) {
-	fn read(reader: &mut dyn Reader) -> Result<(A, B), Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<(A, B), Error> {
 		Ok((Readable::read(reader)?, Readable::read(reader)?))
 	}
 }
@@ -812,7 +938,7 @@ impl<A: Writeable, B: Writeable, C: Writeable, D: Writeable> Writeable for (A, B
 }
 
 impl<A: Readable, B: Readable, C: Readable> Readable for (A, B, C) {
-	fn read(reader: &mut dyn Reader) -> Result<(A, B, C), Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<(A, B, C), Error> {
 		Ok((
 			Readable::read(reader)?,
 			Readable::read(reader)?,
@@ -822,7 +948,7 @@ impl<A: Readable, B: Readable, C: Readable> Readable for (A, B, C) {
 }
 
 impl<A: Readable, B: Readable, C: Readable, D: Readable> Readable for (A, B, C, D) {
-	fn read(reader: &mut dyn Reader) -> Result<(A, B, C, D), Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<(A, B, C, D), Error> {
 		Ok((
 			Readable::read(reader)?,
 			Readable::read(reader)?,
@@ -832,26 +958,17 @@ impl<A: Readable, B: Readable, C: Readable, D: Readable> Readable for (A, B, C, 
 	}
 }
 
-impl Writeable for [u8; 4] {
-	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
-		writer.write_bytes(self)
-	}
-}
-
-/// Trait for types that serialize to a known fixed length.
-pub trait FixedLength {
-	/// The length in bytes
-	const LEN: usize;
-}
-
 /// Trait for types that can be added to a PMMR.
 pub trait PMMRable: Writeable + Clone + Debug + DefaultHashable {
 	/// The type of element actually stored in the MMR data file.
 	/// This allows us to store Hash elements in the header MMR for variable size BlockHeaders.
-	type E: FixedLength + Readable + Writeable + Debug;
+	type E: Readable + Writeable + Debug;
 
 	/// Convert the pmmrable into the element to be stored in the MMR data file.
 	fn as_elmt(&self) -> Self::E;
+
+	/// Size of each element if "fixed" size. Elements are "variable" size if None.
+	fn elmt_size() -> Option<u16>;
 }
 
 /// Generic trait to ensure PMMR elements can be hashed with an index
@@ -863,93 +980,6 @@ pub trait PMMRIndexHashable {
 impl<T: DefaultHashable> PMMRIndexHashable for T {
 	fn hash_with_index(&self, index: u64) -> Hash {
 		(index, self).hash()
-	}
-}
-
-/// Useful marker trait on types that can be sized byte slices
-pub trait AsFixedBytes: Sized + AsRef<[u8]> {
-	/// The length in bytes
-	fn len(&self) -> usize;
-}
-
-impl<'a> AsFixedBytes for &'a [u8] {
-	fn len(&self) -> usize {
-		1
-	}
-}
-impl AsFixedBytes for Vec<u8> {
-	fn len(&self) -> usize {
-		self.len()
-	}
-}
-impl AsFixedBytes for [u8; 1] {
-	fn len(&self) -> usize {
-		1
-	}
-}
-impl AsFixedBytes for [u8; 2] {
-	fn len(&self) -> usize {
-		2
-	}
-}
-impl AsFixedBytes for [u8; 4] {
-	fn len(&self) -> usize {
-		4
-	}
-}
-impl AsFixedBytes for [u8; 6] {
-	fn len(&self) -> usize {
-		6
-	}
-}
-impl AsFixedBytes for [u8; 8] {
-	fn len(&self) -> usize {
-		8
-	}
-}
-impl AsFixedBytes for [u8; 20] {
-	fn len(&self) -> usize {
-		20
-	}
-}
-impl AsFixedBytes for [u8; 32] {
-	fn len(&self) -> usize {
-		32
-	}
-}
-impl AsFixedBytes for String {
-	fn len(&self) -> usize {
-		self.len()
-	}
-}
-impl AsFixedBytes for crate::core::hash::Hash {
-	fn len(&self) -> usize {
-		32
-	}
-}
-impl AsFixedBytes for util::secp::pedersen::RangeProof {
-	fn len(&self) -> usize {
-		self.plen
-	}
-}
-impl AsFixedBytes for util::secp::Signature {
-	fn len(&self) -> usize {
-		64
-	}
-}
-impl AsFixedBytes for util::secp::pedersen::Commitment {
-	fn len(&self) -> usize {
-		PEDERSEN_COMMITMENT_SIZE
-	}
-}
-impl AsFixedBytes for BlindingFactor {
-	fn len(&self) -> usize {
-		SECRET_KEY_SIZE
-	}
-}
-impl AsFixedBytes for keychain::Identifier {
-	fn len(&self) -> usize {
-		IDENTIFIER_SIZE
 	}
 }
 
@@ -1365,7 +1395,7 @@ where
 			}
 		}
 	}
-	const VARIANTS: &'static [&'static str] = &[
+	const VARIANTS: &[&str] = &[
 		"NotFound",
 		"PermissionDenied",
 		"ConnectionRefused",

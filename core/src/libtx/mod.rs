@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,5 +48,5 @@ pub fn tx_fee(
 		None => DEFAULT_BASE_FEE,
 	};
 
-	(Transaction::weight(input_len, output_len, kernel_len) as u64) * use_base_fee
+	Transaction::weight(input_len as u64, output_len as u64, kernel_len as u64) * use_base_fee
 }

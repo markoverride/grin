@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use crate::rest::*;
 use crate::router::{Handler, ResponseFuture};
 use crate::types::*;
 use crate::web::*;
-use hyper::{Body, Request, StatusCode};
+use hyper::{Body, Request};
 use serde_json::json;
 use std::sync::Weak;
 
@@ -34,29 +34,6 @@ impl IndexHandler {}
 impl Handler for IndexHandler {
 	fn get(&self, _req: Request<Body>) -> ResponseFuture {
 		json_response_pretty(&self.list)
-	}
-}
-
-pub struct KernelDownloadHandler {
-	pub peers: Weak<p2p::Peers>,
-}
-
-impl Handler for KernelDownloadHandler {
-	fn post(&self, _req: Request<Body>) -> ResponseFuture {
-		if let Some(peer) = w_fut!(&self.peers).most_work_peer() {
-			match peer.send_kernel_data_request() {
-				Ok(_) => response(StatusCode::OK, "{}"),
-				Err(e) => response(
-					StatusCode::INTERNAL_SERVER_ERROR,
-					format!("requesting kernel data from peer failed: {:?}", e),
-				),
-			}
-		} else {
-			response(
-				StatusCode::INTERNAL_SERVER_ERROR,
-				format!("requesting kernel data from peer failed (no peers)"),
-			)
-		}
 	}
 }
 
@@ -102,16 +79,11 @@ fn sync_status_to_api(sync_status: SyncStatus) -> (String, Option<serde_json::Va
 			"header_sync".to_string(),
 			Some(json!({ "current_height": current_height, "highest_height": highest_height })),
 		),
-		SyncStatus::TxHashsetDownload {
-			start_time: _,
-			prev_update_time: _,
-			update_time: _,
-			prev_downloaded_size: _,
-			downloaded_size,
-			total_size,
-		} => (
+		SyncStatus::TxHashsetDownload(stats) => (
 			"txhashset_download".to_string(),
-			Some(json!({ "downloaded_size": downloaded_size, "total_size": total_size })),
+			Some(
+				json!({ "downloaded_size": stats.downloaded_size, "total_size": stats.total_size }),
+			),
 		),
 		SyncStatus::TxHashsetRangeProofsValidation {
 			rproofs,

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,7 +47,8 @@ pub struct TxHashSetHandler {
 impl TxHashSetHandler {
 	// gets roots
 	fn get_roots(&self) -> Result<TxHashSet, Error> {
-		let res = TxHashSet::from_head(w(&self.chain)?).context(ErrorKind::Internal(
+		let chain = w(&self.chain)?;
+		let res = TxHashSet::from_head(&chain).context(ErrorKind::Internal(
 			"failed to read roots from txhashset".to_owned(),
 		))?;
 		Ok(res)
@@ -55,20 +56,20 @@ impl TxHashSetHandler {
 
 	// gets last n outputs inserted in to the tree
 	fn get_last_n_output(&self, distance: u64) -> Result<Vec<TxHashSetNode>, Error> {
-		Ok(TxHashSetNode::get_last_n_output(w(&self.chain)?, distance))
+		let chain = w(&self.chain)?;
+		Ok(TxHashSetNode::get_last_n_output(&chain, distance))
 	}
 
 	// gets last n rangeproofs inserted in to the tree
 	fn get_last_n_rangeproof(&self, distance: u64) -> Result<Vec<TxHashSetNode>, Error> {
-		Ok(TxHashSetNode::get_last_n_rangeproof(
-			w(&self.chain)?,
-			distance,
-		))
+		let chain = w(&self.chain)?;
+		Ok(TxHashSetNode::get_last_n_rangeproof(&chain, distance))
 	}
 
 	// gets last n kernels inserted in to the tree
 	fn get_last_n_kernel(&self, distance: u64) -> Result<Vec<TxHashSetNode>, Error> {
-		Ok(TxHashSetNode::get_last_n_kernel(w(&self.chain)?, distance))
+		let chain = w(&self.chain)?;
+		Ok(TxHashSetNode::get_last_n_kernel(&chain, distance))
 	}
 
 	// allows traversal of utxo set
@@ -92,7 +93,7 @@ impl TxHashSetHandler {
 			outputs: outputs
 				.2
 				.iter()
-				.map(|x| OutputPrintable::from_output(x, chain.clone(), None, true, true))
+				.map(|x| OutputPrintable::from_output(x, &chain, None, true, true))
 				.collect::<Result<Vec<_>, _>>()
 				.context(ErrorKind::Internal("chain error".to_owned()))?,
 		};
@@ -120,10 +121,8 @@ impl TxHashSetHandler {
 	// return a dummy output with merkle proof for position filled out
 	// (to avoid having to create a new type to pass around)
 	fn get_merkle_proof_for_output(&self, id: &str) -> Result<OutputPrintable, Error> {
-		let c = util::from_hex(String::from(id)).context(ErrorKind::Argument(format!(
-			"Not a valid commitment: {}",
-			id
-		)))?;
+		let c = util::from_hex(id)
+			.map_err(|_| ErrorKind::Argument(format!("Not a valid commitment: {}", id)))?;
 		let commit = Commitment::from_vec(c);
 		let chain = w(&self.chain)?;
 		let output_pos = chain.get_output_pos(&commit).context(ErrorKind::NotFound)?;

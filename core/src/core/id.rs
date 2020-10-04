@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use crate::ser::{self, Readable, Reader, Writeable, Writer};
 use byteorder::{ByteOrder, LittleEndian};
 use siphasher::sip::SipHasher24;
 use std::cmp::{min, Ordering};
-use util;
+use util::ToHex;
 
 /// The size of a short id used to identify inputs|outputs|kernels (6 bytes)
 pub const SHORT_ID_SIZE: usize = 6;
@@ -67,7 +67,7 @@ impl<H: Hashed> ShortIdentifiable for H {
 }
 
 /// Short id for identifying inputs/outputs/kernels
-#[derive(Clone, Serialize, Deserialize, Hash)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ShortId([u8; 6]);
 
 impl DefaultHashable for ShortId {}
@@ -84,8 +84,14 @@ impl ::std::fmt::Debug for ShortId {
 	}
 }
 
+impl AsRef<[u8]> for ShortId {
+	fn as_ref(&self) -> &[u8] {
+		self.0.as_ref()
+	}
+}
+
 impl Readable for ShortId {
-	fn read(reader: &mut dyn Reader) -> Result<ShortId, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<ShortId, ser::Error> {
 		let v = reader.read_fixed_bytes(SHORT_ID_SIZE)?;
 		let mut a = [0; SHORT_ID_SIZE];
 		a.copy_from_slice(&v[..]);
@@ -108,14 +114,9 @@ impl ShortId {
 		ShortId(hash)
 	}
 
-	/// Hex string representation of a short_id
-	pub fn to_hex(&self) -> String {
-		util::to_hex(self.0.to_vec())
-	}
-
 	/// Reconstructs a switch commit hash from a hex string.
 	pub fn from_hex(hex: &str) -> Result<ShortId, ser::Error> {
-		let bytes = util::from_hex(hex.to_string())
+		let bytes = util::from_hex(hex)
 			.map_err(|_| ser::Error::HexError("short_id from_hex error".to_string()))?;
 		Ok(ShortId::from_bytes(&bytes))
 	}

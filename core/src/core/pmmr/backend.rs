@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-use std::fs::File;
 
 use croaring::Bitmap;
 
@@ -67,11 +65,6 @@ pub trait Backend<T: PMMRable> {
 	/// given index (practically the index is the height of a block that
 	/// triggered removal).
 	fn remove(&mut self, position: u64) -> Result<(), String>;
-
-	/// Creates a temp file containing the contents of the underlying data file
-	/// from the backend storage. This allows a caller to see a consistent view
-	/// of the data without needing to lock the backend storage.
-	fn data_as_temp_file(&self) -> Result<File, String>;
 
 	/// Release underlying datafiles and locks
 	fn release_files(&mut self);

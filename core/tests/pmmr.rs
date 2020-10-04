@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 mod common;
 
 use self::core::core::hash::Hash;
-use self::core::core::pmmr::{self, VecBackend, PMMR};
+use self::core::core::pmmr::{self, ReadablePMMR, VecBackend, PMMR};
 use self::core::ser::PMMRIndexHashable;
 use crate::common::TestElem;
 use chrono::prelude::Utc;
@@ -41,7 +41,7 @@ fn some_peak_map() {
 fn bench_peak_map() {
 	let nano_to_millis = 1.0 / 1_000_000.0;
 
-	let increments = vec![1000_000u64, 10_000_000u64, 100_000_000u64];
+	let increments = vec![1_000_000u64, 10_000_000u64, 100_000_000u64];
 
 	for v in increments {
 		let start = Utc::now().timestamp_nanos();
@@ -150,10 +150,9 @@ fn various_families() {
 
 #[test]
 fn test_paths() {
-	assert_eq!(pmmr::path(1, 1), [1]);
-	assert_eq!(pmmr::path(1, 3), [1, 3]);
-	assert_eq!(pmmr::path(2, 3), [2, 3]);
-	assert_eq!(pmmr::path(4, 16), [4, 6, 7, 15]);
+	assert_eq!(pmmr::path(1, 3).collect::<Vec<_>>(), [1, 3]);
+	assert_eq!(pmmr::path(2, 3).collect::<Vec<_>>(), [2, 3]);
+	assert_eq!(pmmr::path(4, 16).collect::<Vec<_>>(), [4, 6, 7, 15]);
 }
 
 #[test]
@@ -374,7 +373,7 @@ fn pmmr_get_last_n_insertions() {
 
 	// test when empty
 	let res = pmmr.readonly_pmmr().get_last_n_insertions(19);
-	assert!(res.len() == 0);
+	assert!(res.is_empty());
 
 	pmmr.push(&elems[0]).unwrap();
 	let res = pmmr.readonly_pmmr().get_last_n_insertions(19);

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
 //! Common test functions
 
 use grin_core::core::hash::DefaultHashable;
-use grin_core::core::{Block, BlockHeader, KernelFeatures, Transaction};
+use grin_core::core::{
+	Block, BlockHeader, KernelFeatures, OutputFeatures, OutputIdentifier, Transaction,
+};
 use grin_core::libtx::{
 	build::{self, input, output},
 	proof::{ProofBuild, ProofBuilder},
 	reward,
 };
 use grin_core::pow::Difficulty;
-use grin_core::ser::{self, FixedLength, PMMRable, Readable, Reader, Writeable, Writer};
+use grin_core::ser::{self, PMMRable, Readable, Reader, Writeable, Writer};
 use keychain::{Identifier, Keychain};
 
 // utility producing a transaction with 2 inputs and a single outputs
@@ -34,13 +36,15 @@ pub fn tx2i1o() -> Transaction {
 	let key_id2 = keychain::ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
 	let key_id3 = keychain::ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
 
-	build::transaction(
+	let tx = build::transaction(
 		KernelFeatures::Plain { fee: 2 },
-		vec![input(10, key_id1), input(11, key_id2), output(19, key_id3)],
+		&[input(10, key_id1), input(11, key_id2), output(19, key_id3)],
 		&keychain,
 		&builder,
 	)
-	.unwrap()
+	.unwrap();
+
+	tx
 }
 
 // utility producing a transaction with a single input and output
@@ -51,13 +55,33 @@ pub fn tx1i1o() -> Transaction {
 	let key_id1 = keychain::ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
 	let key_id2 = keychain::ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
 
-	build::transaction(
+	let tx = build::transaction(
 		KernelFeatures::Plain { fee: 2 },
-		vec![input(5, key_id1), output(3, key_id2)],
+		&[input(5, key_id1), output(3, key_id2)],
 		&keychain,
 		&builder,
 	)
-	.unwrap()
+	.unwrap();
+
+	tx
+}
+
+#[allow(dead_code)]
+pub fn tx1i10_v2_compatible() -> Transaction {
+	let tx = tx1i1o();
+
+	let inputs: Vec<_> = tx.inputs().into();
+	let inputs: Vec<_> = inputs
+		.iter()
+		.map(|input| OutputIdentifier {
+			features: OutputFeatures::Plain,
+			commit: input.commitment(),
+		})
+		.collect();
+	Transaction {
+		body: tx.body.replace_inputs(inputs.as_slice().into()),
+		..tx
+	}
 }
 
 // utility producing a transaction with a single input
@@ -71,20 +95,22 @@ pub fn tx1i2o() -> Transaction {
 	let key_id2 = keychain::ExtKeychain::derive_key_id(1, 2, 0, 0, 0);
 	let key_id3 = keychain::ExtKeychain::derive_key_id(1, 3, 0, 0, 0);
 
-	build::transaction(
+	let tx = build::transaction(
 		KernelFeatures::Plain { fee: 2 },
-		vec![input(6, key_id1), output(3, key_id2), output(1, key_id3)],
+		&[input(6, key_id1), output(3, key_id2), output(1, key_id3)],
 		&keychain,
 		&builder,
 	)
-	.unwrap()
+	.unwrap();
+
+	tx
 }
 
 // utility to create a block without worrying about the key or previous
 // header
 #[allow(dead_code)]
 pub fn new_block<K, B>(
-	txs: Vec<&Transaction>,
+	txs: &[Transaction],
 	keychain: &K,
 	builder: &B,
 	previous_header: &BlockHeader,
@@ -96,13 +122,7 @@ where
 {
 	let fees = txs.iter().map(|tx| tx.fee()).sum();
 	let reward_output = reward::output(keychain, builder, &key_id, fees, false).unwrap();
-	Block::new(
-		&previous_header,
-		txs.into_iter().cloned().collect(),
-		Difficulty::min(),
-		reward_output,
-	)
-	.unwrap()
+	Block::new(&previous_header, txs, Difficulty::min(), reward_output).unwrap()
 }
 
 // utility producing a transaction that spends an output with the provided
@@ -121,7 +141,7 @@ where
 {
 	build::transaction(
 		KernelFeatures::Plain { fee: 2 },
-		vec![input(v, key_id1), output(3, key_id2)],
+		&[input(v, key_id1), output(3, key_id2)],
 		keychain,
 		builder,
 	)
@@ -133,15 +153,15 @@ pub struct TestElem(pub [u32; 4]);
 
 impl DefaultHashable for TestElem {}
 
-impl FixedLength for TestElem {
-	const LEN: usize = 16;
-}
-
 impl PMMRable for TestElem {
 	type E = Self;
 
 	fn as_elmt(&self) -> Self::E {
-		self.clone()
+		*self
+	}
+
+	fn elmt_size() -> Option<u16> {
+		Some(16)
 	}
 }
 
@@ -155,7 +175,7 @@ impl Writeable for TestElem {
 }
 
 impl Readable for TestElem {
-	fn read(reader: &mut dyn Reader) -> Result<TestElem, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<TestElem, ser::Error> {
 		Ok(TestElem([
 			reader.read_u32()?,
 			reader.read_u32()?,

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,11 +22,14 @@ use lmdb_zero as lmdb;
 use lmdb_zero::traits::CreateCursor;
 use lmdb_zero::LmdbResultExt;
 
+use crate::core::global;
 use crate::core::ser::{self, ProtocolVersion};
-use crate::util::{RwLock, RwLockReadGuard};
+use crate::util::RwLock;
 
 /// number of bytes to grow the database by when needed
-pub const ALLOC_CHUNK_SIZE: usize = 134_217_728; //128 MB
+pub const ALLOC_CHUNK_SIZE_DEFAULT: usize = 134_217_728; //128 MB
+/// And for test mode, to avoid too much disk allocation on windows
+pub const ALLOC_CHUNK_SIZE_DEFAULT_TEST: usize = 1_048_576; //1 MB
 const RESIZE_PERCENT: f32 = 0.9;
 /// Want to ensure that each resize gives us at least this %
 /// of total space free
@@ -38,13 +41,18 @@ pub enum Error {
 	/// Couldn't find what we were looking for
 	#[fail(display = "DB Not Found Error: {}", _0)]
 	NotFoundErr(String),
-	/// Wraps an error originating from RocksDB (which unfortunately returns
-	/// string errors).
-	#[fail(display = "LMDB error")]
+	/// Wraps an error originating from LMDB
+	#[fail(display = "LMDB error: {} ", _0)]
 	LmdbErr(lmdb::error::Error),
 	/// Wraps a serialization error for Writeable or Readable
 	#[fail(display = "Serialization Error")]
 	SerErr(String),
+	/// File handling error
+	#[fail(display = "File handling Error")]
+	FileErr(String),
+	/// Other error
+	#[fail(display = "Other Error")]
+	OtherErr(String),
 }
 
 impl From<lmdb::error::Error> for Error {
@@ -65,7 +73,7 @@ where
 	}
 }
 
-const DEFAULT_DB_VERSION: ProtocolVersion = ProtocolVersion(2);
+const DEFAULT_DB_VERSION: ProtocolVersion = ProtocolVersion(3);
 
 /// LMDB-backed store facilitating data access and serialization. All writes
 /// are done through a Batch abstraction providing atomicity.
@@ -74,6 +82,7 @@ pub struct Store {
 	db: Arc<RwLock<Option<Arc<lmdb::Database<'static>>>>>,
 	name: String,
 	version: ProtocolVersion,
+	alloc_chunk_size: usize,
 }
 
 impl Store {
@@ -95,29 +104,35 @@ impl Store {
 			Some(n) => n.to_owned(),
 			None => "lmdb".to_owned(),
 		};
-		let full_path = [root_path.to_owned(), name.clone()].join("/");
-		fs::create_dir_all(&full_path)
-			.expect("Unable to create directory 'db_root' to store chain_data");
+		let full_path = [root_path.to_owned(), name].join("/");
+		fs::create_dir_all(&full_path).map_err(|e| {
+			Error::FileErr(format!(
+				"Unable to create directory 'db_root' to store chain_data: {:?}",
+				e
+			))
+		})?;
 
-		let mut env_builder = lmdb::EnvBuilder::new().unwrap();
+		let mut env_builder = lmdb::EnvBuilder::new()?;
 		env_builder.set_maxdbs(8)?;
 
 		if let Some(max_readers) = max_readers {
 			env_builder.set_maxreaders(max_readers)?;
 		}
 
+		let alloc_chunk_size = match global::is_production_mode() {
+			true => ALLOC_CHUNK_SIZE_DEFAULT,
+			false => ALLOC_CHUNK_SIZE_DEFAULT_TEST,
+		};
+
 		let env = unsafe { env_builder.open(&full_path, lmdb::open::NOTLS, 0o600)? };
 
-		debug!(
-			"DB Mapsize for {} is {}",
-			full_path,
-			env.info().as_ref().unwrap().mapsize
-		);
+		debug!("DB Mapsize for {} is {}", full_path, env.info()?.mapsize);
 		let res = Store {
 			env: Arc::new(env),
 			db: Arc::new(RwLock::new(None)),
 			name: db_name,
 			version: DEFAULT_DB_VERSION,
+			alloc_chunk_size,
 		};
 
 		{
@@ -134,12 +149,22 @@ impl Store {
 	/// Construct a new store using a specific protocol version.
 	/// Permits access to the db with legacy protocol versions for db migrations.
 	pub fn with_version(&self, version: ProtocolVersion) -> Store {
+		let alloc_chunk_size = match global::is_production_mode() {
+			true => ALLOC_CHUNK_SIZE_DEFAULT,
+			false => ALLOC_CHUNK_SIZE_DEFAULT_TEST,
+		};
 		Store {
 			env: self.env.clone(),
 			db: self.db.clone(),
 			name: self.name.clone(),
-			version: version,
+			version,
+			alloc_chunk_size,
 		}
+	}
+
+	/// Protocol version for the store.
+	pub fn protocol_version(&self) -> ProtocolVersion {
+		self.version
 	}
 
 	/// Opens the database environment
@@ -172,7 +197,7 @@ impl Store {
 		);
 
 		if size_used as f32 / env_info.mapsize as f32 > resize_percent
-			|| env_info.mapsize < ALLOC_CHUNK_SIZE
+			|| env_info.mapsize < self.alloc_chunk_size
 		{
 			trace!("Resize threshold met (percent-based)");
 			Ok(true)
@@ -189,12 +214,12 @@ impl Store {
 		let stat = self.env.stat()?;
 		let size_used = stat.psize as usize * env_info.last_pgno;
 
-		let new_mapsize = if env_info.mapsize < ALLOC_CHUNK_SIZE {
-			ALLOC_CHUNK_SIZE
+		let new_mapsize = if env_info.mapsize < self.alloc_chunk_size {
+			self.alloc_chunk_size
 		} else {
 			let mut tot = env_info.mapsize;
 			while size_used as f32 / tot as f32 > RESIZE_MIN_TARGET_PERCENT {
-				tot += ALLOC_CHUNK_SIZE;
+				tot += self.alloc_chunk_size;
 			}
 			tot
 		};
@@ -220,64 +245,69 @@ impl Store {
 		Ok(())
 	}
 
-	/// Gets a value from the db, provided its key
-	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-		let db = self.db.read();
-		let txn = lmdb::ReadTransaction::new(self.env.clone())?;
-		let access = txn.access();
-		let res = access.get(&db.as_ref().unwrap(), key);
-		res.map(|res: &[u8]| res.to_vec())
-			.to_opt()
-			.map_err(From::from)
-	}
-
-	/// Gets a `Readable` value from the db, provided its key. Encapsulates
-	/// serialization.
-	pub fn get_ser<T: ser::Readable>(&self, key: &[u8]) -> Result<Option<T>, Error> {
-		let db = self.db.read();
-		let txn = lmdb::ReadTransaction::new(self.env.clone())?;
-		let access = txn.access();
-		self.get_ser_access(key, &access, db)
-	}
-
-	fn get_ser_access<T: ser::Readable>(
+	/// Gets a value from the db, provided its key.
+	/// Deserializes the retrieved data using the provided function.
+	pub fn get_with<T, F>(
 		&self,
 		key: &[u8],
 		access: &lmdb::ConstAccessor<'_>,
-		db: RwLockReadGuard<'_, Option<Arc<lmdb::Database<'static>>>>,
-	) -> Result<Option<T>, Error> {
-		let res: lmdb::error::Result<&[u8]> = access.get(&db.as_ref().unwrap(), key);
-		match res.to_opt() {
-			Ok(Some(mut res)) => match ser::deserialize(&mut res, self.version) {
-				Ok(res) => Ok(Some(res)),
-				Err(e) => Err(Error::SerErr(format!("{}", e))),
-			},
-			Ok(None) => Ok(None),
-			Err(e) => Err(From::from(e)),
+		db: &lmdb::Database<'_>,
+		deserialize: F,
+	) -> Result<Option<T>, Error>
+	where
+		F: Fn(&[u8]) -> Result<T, Error>,
+	{
+		let res: Option<&[u8]> = access.get(db, key).to_opt()?;
+		match res {
+			None => Ok(None),
+			Some(res) => deserialize(res).map(|x| Some(x)),
 		}
+	}
+
+	/// Gets a `Readable` value from the db, provided its key.
+	/// Note: Creates a new read transaction so will *not* see any uncommitted data.
+	pub fn get_ser<T: ser::Readable>(&self, key: &[u8]) -> Result<Option<T>, Error> {
+		let lock = self.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
+		let txn = lmdb::ReadTransaction::new(self.env.clone())?;
+		let access = txn.access();
+
+		self.get_with(key, &access, &db, |mut data| {
+			ser::deserialize(&mut data, self.protocol_version())
+				.map_err(|e| Error::SerErr(format!("{}", e)))
+		})
 	}
 
 	/// Whether the provided key exists
 	pub fn exists(&self, key: &[u8]) -> Result<bool, Error> {
-		let db = self.db.read();
+		let lock = self.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
 		let txn = lmdb::ReadTransaction::new(self.env.clone())?;
 		let access = txn.access();
-		let res: lmdb::error::Result<&lmdb::Ignore> = access.get(&db.as_ref().unwrap(), key);
-		res.to_opt().map(|r| r.is_some()).map_err(From::from)
+
+		let res: Option<&lmdb::Ignore> = access.get(db, key).to_opt()?;
+		Ok(res.is_some())
 	}
 
 	/// Produces an iterator of (key, value) pairs, where values are `Readable` types
 	/// moving forward from the provided key.
 	pub fn iter<T: ser::Readable>(&self, from: &[u8]) -> Result<SerIterator<T>, Error> {
-		let db = self.db.read();
+		let lock = self.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
 		let tx = Arc::new(lmdb::ReadTransaction::new(self.env.clone())?);
-		let cursor = Arc::new(tx.cursor(db.as_ref().unwrap().clone()).unwrap());
+		let cursor = Arc::new(tx.cursor(db.clone())?);
 		Ok(SerIterator {
 			tx,
 			cursor,
 			seek: false,
 			prefix: from.to_vec(),
-			version: self.version,
+			version: self.protocol_version(),
 			_marker: marker::PhantomData,
 		})
 	}
@@ -302,17 +332,25 @@ pub struct Batch<'a> {
 impl<'a> Batch<'a> {
 	/// Writes a single key/value pair to the db
 	pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-		let db = self.store.db.read();
+		let lock = self.store.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
 		self.tx
 			.access()
-			.put(&db.as_ref().unwrap(), key, value, lmdb::put::Flags::empty())?;
+			.put(db, key, value, lmdb::put::Flags::empty())?;
 		Ok(())
 	}
 
 	/// Writes a single key and its `Writeable` value to the db.
 	/// Encapsulates serialization using the (default) version configured on the store instance.
 	pub fn put_ser<W: ser::Writeable>(&self, key: &[u8], value: &W) -> Result<(), Error> {
-		self.put_ser_with_version(key, value, self.store.version)
+		self.put_ser_with_version(key, value, self.store.protocol_version())
+	}
+
+	/// Protocol version used by this batch.
+	pub fn protocol_version(&self) -> ProtocolVersion {
+		self.store.protocol_version()
 	}
 
 	/// Writes a single key and its `Writeable` value to the db.
@@ -330,14 +368,31 @@ impl<'a> Batch<'a> {
 		}
 	}
 
-	/// gets a value from the db, provided its key
-	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-		self.store.get(key)
+	/// Low-level access for retrieving data by key.
+	/// Takes a function for flexible deserialization.
+	pub fn get_with<T, F>(&self, key: &[u8], deserialize: F) -> Result<Option<T>, Error>
+	where
+		F: Fn(&[u8]) -> Result<T, Error>,
+	{
+		let access = self.tx.access();
+		let lock = self.store.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
+
+		self.store.get_with(key, &access, &db, deserialize)
 	}
 
-	/// Whether the provided key exists
+	/// Whether the provided key exists.
+	/// This is in the context of the current write transaction.
 	pub fn exists(&self, key: &[u8]) -> Result<bool, Error> {
-		self.store.exists(key)
+		let access = self.tx.access();
+		let lock = self.store.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
+		let res: Option<&lmdb::Ignore> = access.get(db, key).to_opt()?;
+		Ok(res.is_some())
 	}
 
 	/// Produces an iterator of `Readable` types moving forward from the
@@ -346,18 +401,23 @@ impl<'a> Batch<'a> {
 		self.store.iter(from)
 	}
 
-	/// Gets a `Readable` value from the db, provided its key, taking the
-	/// content of the current batch into account.
+	/// Gets a `Readable` value from the db by provided key and default deserialization strategy.
 	pub fn get_ser<T: ser::Readable>(&self, key: &[u8]) -> Result<Option<T>, Error> {
-		let access = self.tx.access();
-		let db = self.store.db.read();
-		self.store.get_ser_access(key, &access, db)
+		self.get_with(key, |mut data| {
+			match ser::deserialize(&mut data, self.protocol_version()) {
+				Ok(res) => Ok(res),
+				Err(e) => Err(Error::SerErr(format!("{}", e))),
+			}
+		})
 	}
 
 	/// Deletes a key/value pair from the db
 	pub fn delete(&self, key: &[u8]) -> Result<(), Error> {
-		let db = self.store.db.read();
-		self.tx.access().del_key(&db.as_ref().unwrap(), key)?;
+		let lock = self.store.db.read();
+		let db = lock
+			.as_ref()
+			.ok_or_else(|| Error::NotFoundErr("chain db is None".to_string()))?;
+		self.tx.access().del_key(db, key)?;
 		Ok(())
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -92,10 +92,8 @@ pub fn genesis_floo() -> core::Block {
 	let kernel = core::TxKernel {
 		features: core::KernelFeatures::Coinbase,
 		excess: Commitment::from_vec(
-			util::from_hex(
-				"08df2f1d996cee37715d9ac0a0f3b13aae508d1101945acb8044954aee30960be9".to_string(),
-			)
-			.unwrap(),
+			util::from_hex("08df2f1d996cee37715d9ac0a0f3b13aae508d1101945acb8044954aee30960be9")
+				.unwrap(),
 		),
 		excess_sig: Signature::from_raw_data(&[
 			25, 176, 52, 246, 172, 1, 12, 220, 247, 111, 73, 101, 13, 16, 157, 130, 110, 196, 123,
@@ -105,15 +103,13 @@ pub fn genesis_floo() -> core::Block {
 		])
 		.unwrap(),
 	};
-	let output = core::Output {
-		features: core::OutputFeatures::Coinbase,
-		commit: Commitment::from_vec(
-			util::from_hex(
-				"08c12007af16d1ee55fffe92cef808c77e318dae70c3bc70cb6361f49d517f1b68".to_string(),
-			)
-			.unwrap(),
+	let output = core::Output::new(
+		core::OutputFeatures::Coinbase,
+		Commitment::from_vec(
+			util::from_hex("08c12007af16d1ee55fffe92cef808c77e318dae70c3bc70cb6361f49d517f1b68")
+				.unwrap(),
 		),
-		proof: RangeProof {
+		RangeProof {
 			plen: SINGLE_BULLET_PROOF_SIZE,
 			proof: [
 				159, 156, 202, 179, 128, 169, 14, 227, 176, 79, 118, 180, 62, 164, 2, 234, 123, 30,
@@ -156,7 +152,7 @@ pub fn genesis_floo() -> core::Block {
 				52, 175, 76, 157, 120, 208, 99, 135, 210, 81, 114, 230, 181,
 			],
 		},
-	};
+	);
 	gen.with_reward(output, kernel)
 }
 
@@ -208,10 +204,8 @@ pub fn genesis_main() -> core::Block {
 	let kernel = core::TxKernel {
 		features: core::KernelFeatures::Coinbase,
 		excess: Commitment::from_vec(
-			util::from_hex(
-				"096385d86c5cfda718aa0b7295be0adf7e5ac051edfe130593a2a257f09f78a3b1".to_string(),
-			)
-			.unwrap(),
+			util::from_hex("096385d86c5cfda718aa0b7295be0adf7e5ac051edfe130593a2a257f09f78a3b1")
+				.unwrap(),
 		),
 		excess_sig: Signature::from_raw_data(&[
 			80, 208, 41, 171, 28, 224, 250, 121, 60, 192, 213, 232, 111, 199, 111, 105, 18, 22, 54,
@@ -221,15 +215,13 @@ pub fn genesis_main() -> core::Block {
 		])
 		.unwrap(),
 	};
-	let output = core::Output {
-		features: core::OutputFeatures::Coinbase,
-		commit: Commitment::from_vec(
-			util::from_hex(
-				"08b7e57c448db5ef25aa119dde2312c64d7ff1b890c416c6dda5ec73cbfed2edea".to_string(),
-			)
-			.unwrap(),
+	let output = core::Output::new(
+		core::OutputFeatures::Coinbase,
+		Commitment::from_vec(
+			util::from_hex("08b7e57c448db5ef25aa119dde2312c64d7ff1b890c416c6dda5ec73cbfed2edea")
+				.unwrap(),
 		),
-		proof: RangeProof {
+		RangeProof {
 			plen: SINGLE_BULLET_PROOF_SIZE,
 			proof: [
 				147, 48, 173, 140, 222, 32, 95, 49, 124, 101, 55, 236, 169, 107, 134, 98, 147, 160,
@@ -272,7 +264,7 @@ pub fn genesis_main() -> core::Block {
 				156, 243, 168, 216, 103, 38, 160, 20, 71, 148,
 			],
 		},
-	};
+	);
 	gen.with_reward(output, kernel)
 }
 
@@ -280,10 +272,13 @@ pub fn genesis_main() -> core::Block {
 mod test {
 	use super::*;
 	use crate::core::hash::Hashed;
+	use crate::global;
 	use crate::ser::{self, ProtocolVersion};
+	use util::ToHex;
 
 	#[test]
 	fn floonet_genesis_hash() {
+		global::set_local_chain_type(global::ChainTypes::Floonet);
 		let gen_hash = genesis_floo().hash();
 		println!("floonet genesis hash: {}", gen_hash.to_hex());
 		let gen_bin = ser::ser_vec(&genesis_floo(), ProtocolVersion(1)).unwrap();
@@ -300,6 +295,7 @@ mod test {
 
 	#[test]
 	fn mainnet_genesis_hash() {
+		global::set_local_chain_type(global::ChainTypes::Mainnet);
 		let gen_hash = genesis_main().hash();
 		println!("mainnet genesis hash: {}", gen_hash.to_hex());
 		let gen_bin = ser::ser_vec(&genesis_main(), ProtocolVersion(1)).unwrap();

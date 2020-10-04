@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -96,8 +96,7 @@ impl LeafSet {
 	/// Only applicable for the output MMR.
 	fn unpruned_pre_cutoff(&self, cutoff_pos: u64, prune_list: &PruneList) -> Bitmap {
 		(1..=cutoff_pos)
-			.filter(|&x| pmmr::is_leaf(x))
-			.filter(|&x| !prune_list.is_pruned(x))
+			.filter(|&x| pmmr::is_leaf(x) && !prune_list.is_pruned(x))
 			.map(|x| x as u32)
 			.collect()
 	}
@@ -115,7 +114,7 @@ impl LeafSet {
 
 		// First remove pos from leaf_set that were
 		// added after the point we are rewinding to.
-		let to_remove = ((cutoff_pos + 1) as u32)..bitmap.maximum();
+		let to_remove = ((cutoff_pos + 1) as u32)..bitmap.maximum().unwrap_or(0);
 		bitmap.remove_range_closed(to_remove);
 
 		// Then add back output pos to the leaf_set
@@ -134,7 +133,7 @@ impl LeafSet {
 	pub fn rewind(&mut self, cutoff_pos: u64, rewind_rm_pos: &Bitmap) {
 		// First remove pos from leaf_set that were
 		// added after the point we are rewinding to.
-		let to_remove = ((cutoff_pos + 1) as u32)..self.bitmap.maximum();
+		let to_remove = ((cutoff_pos + 1) as u32)..self.bitmap.maximum().unwrap_or(0);
 		self.bitmap.remove_range_closed(to_remove);
 
 		// Then add back output pos to the leaf_set
@@ -172,10 +171,8 @@ impl LeafSet {
 		self.bitmap.run_optimize();
 
 		// Write the updated bitmap file to disk.
-		save_via_temp_file(&self.path, ".tmp", |w| {
-			let mut w = BufWriter::new(w);
-			w.write_all(&self.bitmap.serialize())?;
-			w.flush()
+		save_via_temp_file(&self.path, ".tmp", |file| {
+			file.write_all(&self.bitmap.serialize())
 		})?;
 
 		// Make sure our backup in memory is up to date.

@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,7 +34,6 @@ use self::peers_api::PeersConnectedHandler;
 use self::pool_api::PoolInfoHandler;
 use self::pool_api::PoolPushHandler;
 use self::server_api::IndexHandler;
-use self::server_api::KernelDownloadHandler;
 use self::server_api::StatusHandler;
 use self::transactions_api::TxHashSetHandler;
 use self::version_api::VersionHandler;
@@ -43,12 +42,14 @@ use crate::auth::{
 };
 use crate::chain;
 use crate::chain::{Chain, SyncState};
+use crate::core::core::verifier_cache::VerifierCache;
 use crate::foreign::Foreign;
 use crate::foreign_rpc::ForeignRpc;
 use crate::owner::Owner;
 use crate::owner_rpc::OwnerRpc;
 use crate::p2p;
 use crate::pool;
+use crate::pool::{BlockChain, PoolAdapter};
 use crate::rest::{ApiServer, Error, TLSConfig};
 use crate::router::ResponseFuture;
 use crate::router::{Router, RouterError};
@@ -56,8 +57,6 @@ use crate::util::to_base64;
 use crate::util::RwLock;
 use crate::web::*;
 use easy_jsonrpc_mw::{Handler, MaybeReply};
-use futures::future::ok;
-use futures::Future;
 use hyper::{Body, Request, Response, StatusCode};
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -65,16 +64,21 @@ use std::sync::{Arc, Weak};
 
 /// Listener version, providing same API but listening for requests on a
 /// port and wrapping the calls
-pub fn node_apis(
+pub fn node_apis<B, P, V>(
 	addr: &str,
 	chain: Arc<chain::Chain>,
-	tx_pool: Arc<RwLock<pool::TransactionPool>>,
+	tx_pool: Arc<RwLock<pool::TransactionPool<B, P, V>>>,
 	peers: Arc<p2p::Peers>,
 	sync_state: Arc<chain::SyncState>,
 	api_secret: Option<String>,
 	foreign_api_secret: Option<String>,
 	tls_config: Option<TLSConfig>,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+	B: BlockChain + 'static,
+	P: PoolAdapter + 'static,
+	V: VerifierCache + 'static,
+{
 	// Manually build router when getting rid of v1
 	//let mut router = Router::new();
 	let mut router = build_router(
@@ -139,8 +143,6 @@ pub fn node_apis(
 	}
 }
 
-type NodeResponseFuture = Box<dyn Future<Item = Response<Body>, Error = Error> + Send>;
-
 /// V2 API Handler/Wrapper for owner functions
 pub struct OwnerAPIHandlerV2 {
 	pub chain: Weak<Chain>,
@@ -157,67 +159,65 @@ impl OwnerAPIHandlerV2 {
 			sync_state,
 		}
 	}
+}
 
-	fn call_api(
-		&self,
-		req: Request<Body>,
-		api: Owner,
-	) -> Box<dyn Future<Item = serde_json::Value, Error = Error> + Send> {
-		Box::new(parse_body(req).and_then(move |val: serde_json::Value| {
-			let owner_api = &api as &dyn OwnerRpc;
-			match owner_api.handle_request(val) {
-				MaybeReply::Reply(r) => ok(r),
-				MaybeReply::DontReply => {
-					// Since it's http, we need to return something. We return [] because jsonrpc
-					// clients will parse it as an empty batch response.
-					ok(serde_json::json!([]))
-				}
-			}
-		}))
-	}
-
-	fn handle_post_request(&self, req: Request<Body>) -> NodeResponseFuture {
+impl crate::router::Handler for OwnerAPIHandlerV2 {
+	fn post(&self, req: Request<Body>) -> ResponseFuture {
 		let api = Owner::new(
 			self.chain.clone(),
 			self.peers.clone(),
 			self.sync_state.clone(),
 		);
-		Box::new(
-			self.call_api(req, api)
-				.and_then(|resp| ok(json_response_pretty(&resp))),
-		)
-	}
-}
 
-impl crate::router::Handler for OwnerAPIHandlerV2 {
-	fn post(&self, req: Request<Body>) -> ResponseFuture {
-		Box::new(
-			self.handle_post_request(req)
-				.and_then(|r| ok(r))
-				.or_else(|e| {
+		Box::pin(async move {
+			match parse_body(req).await {
+				Ok(val) => {
+					let owner_api = &api as &dyn OwnerRpc;
+					let res = match owner_api.handle_request(val) {
+						MaybeReply::Reply(r) => r,
+						MaybeReply::DontReply => {
+							// Since it's http, we need to return something. We return [] because jsonrpc
+							// clients will parse it as an empty batch response.
+							serde_json::json!([])
+						}
+					};
+					Ok(json_response_pretty(&res))
+				}
+				Err(e) => {
 					error!("Request Error: {:?}", e);
-					ok(create_error_response(e))
-				}),
-		)
+					Ok(create_error_response(e))
+				}
+			}
+		})
 	}
 
 	fn options(&self, _req: Request<Body>) -> ResponseFuture {
-		Box::new(ok(create_ok_response("{}")))
+		Box::pin(async { Ok(create_ok_response("{}")) })
 	}
 }
 
 /// V2 API Handler/Wrapper for foreign functions
-pub struct ForeignAPIHandlerV2 {
+pub struct ForeignAPIHandlerV2<B, P, V>
+where
+	B: BlockChain,
+	P: PoolAdapter,
+	V: VerifierCache + 'static,
+{
 	pub chain: Weak<Chain>,
-	pub tx_pool: Weak<RwLock<pool::TransactionPool>>,
+	pub tx_pool: Weak<RwLock<pool::TransactionPool<B, P, V>>>,
 	pub sync_state: Weak<SyncState>,
 }
 
-impl ForeignAPIHandlerV2 {
+impl<B, P, V> ForeignAPIHandlerV2<B, P, V>
+where
+	B: BlockChain,
+	P: PoolAdapter,
+	V: VerifierCache + 'static,
+{
 	/// Create a new foreign API handler for GET methods
 	pub fn new(
 		chain: Weak<Chain>,
-		tx_pool: Weak<RwLock<pool::TransactionPool>>,
+		tx_pool: Weak<RwLock<pool::TransactionPool<B, P, V>>>,
 		sync_state: Weak<SyncState>,
 	) -> Self {
 		ForeignAPIHandlerV2 {
@@ -226,52 +226,45 @@ impl ForeignAPIHandlerV2 {
 			sync_state,
 		}
 	}
+}
 
-	fn call_api(
-		&self,
-		req: Request<Body>,
-		api: Foreign,
-	) -> Box<dyn Future<Item = serde_json::Value, Error = Error> + Send> {
-		Box::new(parse_body(req).and_then(move |val: serde_json::Value| {
-			let foreign_api = &api as &dyn ForeignRpc;
-			match foreign_api.handle_request(val) {
-				MaybeReply::Reply(r) => ok(r),
-				MaybeReply::DontReply => {
-					// Since it's http, we need to return something. We return [] because jsonrpc
-					// clients will parse it as an empty batch response.
-					ok(serde_json::json!([]))
-				}
-			}
-		}))
-	}
-
-	fn handle_post_request(&self, req: Request<Body>) -> NodeResponseFuture {
+impl<B, P, V> crate::router::Handler for ForeignAPIHandlerV2<B, P, V>
+where
+	B: BlockChain + 'static,
+	P: PoolAdapter + 'static,
+	V: VerifierCache + 'static,
+{
+	fn post(&self, req: Request<Body>) -> ResponseFuture {
 		let api = Foreign::new(
 			self.chain.clone(),
 			self.tx_pool.clone(),
 			self.sync_state.clone(),
 		);
-		Box::new(
-			self.call_api(req, api)
-				.and_then(|resp| ok(json_response_pretty(&resp))),
-		)
-	}
-}
 
-impl crate::router::Handler for ForeignAPIHandlerV2 {
-	fn post(&self, req: Request<Body>) -> ResponseFuture {
-		Box::new(
-			self.handle_post_request(req)
-				.and_then(|r| ok(r))
-				.or_else(|e| {
+		Box::pin(async move {
+			match parse_body(req).await {
+				Ok(val) => {
+					let foreign_api = &api as &dyn ForeignRpc;
+					let res = match foreign_api.handle_request(val) {
+						MaybeReply::Reply(r) => r,
+						MaybeReply::DontReply => {
+							// Since it's http, we need to return something. We return [] because jsonrpc
+							// clients will parse it as an empty batch response.
+							serde_json::json!([])
+						}
+					};
+					Ok(json_response_pretty(&res))
+				}
+				Err(e) => {
 					error!("Request Error: {:?}", e);
-					ok(create_error_response(e))
-				}),
-		)
+					Ok(create_error_response(e))
+				}
+			}
+		})
 	}
 
 	fn options(&self, _req: Request<Body>) -> ResponseFuture {
-		Box::new(ok(create_ok_response("{}")))
+		Box::pin(async { Ok(create_ok_response("{}")) })
 	}
 }
 
@@ -316,7 +309,7 @@ fn create_ok_response(json: &str) -> Response<Body> {
 /// Whenever the status code is `StatusCode::OK` the text parameter should be
 /// valid JSON as the content type header will be set to `application/json'
 fn response<T: Into<Body>>(status: StatusCode, text: T) -> Response<Body> {
-	let mut builder = &mut Response::builder();
+	let mut builder = Response::builder();
 
 	builder = builder
 		.status(status)
@@ -334,12 +327,21 @@ fn response<T: Into<Body>>(status: StatusCode, text: T) -> Response<Body> {
 }
 
 // Legacy V1 router
-pub fn build_router(
+#[deprecated(
+	since = "4.0.0",
+	note = "The V1 Node API will be removed in grin 5.0.0. Please migrate to the V2 API as soon as possible."
+)]
+pub fn build_router<B, P, V>(
 	chain: Arc<chain::Chain>,
-	tx_pool: Arc<RwLock<pool::TransactionPool>>,
+	tx_pool: Arc<RwLock<pool::TransactionPool<B, P, V>>>,
 	peers: Arc<p2p::Peers>,
 	sync_state: Arc<chain::SyncState>,
-) -> Result<Router, RouterError> {
+) -> Result<Router, RouterError>
+where
+	B: BlockChain + 'static,
+	P: PoolAdapter + 'static,
+	V: VerifierCache + 'static,
+{
 	let route_list = vec![
 		"get blocks".to_string(),
 		"get headers".to_string(),
@@ -393,9 +395,6 @@ pub fn build_router(
 		peers: Arc::downgrade(&peers),
 		sync_state: Arc::downgrade(&sync_state),
 	};
-	let kernel_download_handler = KernelDownloadHandler {
-		peers: Arc::downgrade(&peers),
-	};
 	let txhashset_handler = TxHashSetHandler {
 		chain: Arc::downgrade(&chain),
 	};
@@ -430,7 +429,6 @@ pub fn build_router(
 	router.add_route("/v1/chain/validate", Arc::new(chain_validation_handler))?;
 	router.add_route("/v1/txhashset/*", Arc::new(txhashset_handler))?;
 	router.add_route("/v1/status", Arc::new(status_handler))?;
-	router.add_route("/v1/kerneldownload", Arc::new(kernel_download_handler))?;
 	router.add_route("/v1/pool", Arc::new(pool_info_handler))?;
 	router.add_route("/v1/pool/push_tx", Arc::new(pool_push_handler))?;
 	router.add_route("/v1/peers/all", Arc::new(peers_all_handler))?;

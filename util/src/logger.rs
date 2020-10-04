@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -150,6 +150,8 @@ pub fn init_logger(config: Option<LoggingConfig>, logs_tx: Option<mpsc::SyncSend
 			*tui_running_ref = true;
 		}
 
+		let mut was_init_ref = WAS_INIT.lock();
+
 		// Save current logging configuration
 		let mut config_ref = LOGGING_CONFIG.lock();
 		*config_ref = c.clone();
@@ -250,7 +252,6 @@ pub fn init_logger(config: Option<LoggingConfig>, logs_tx: Option<mpsc::SyncSend
 		);
 
 		// Mark logger as initialized
-		let mut was_init_ref = WAS_INIT.lock();
 		*was_init_ref = true;
 	}
 
@@ -340,7 +341,7 @@ fn send_panic_to_log() {
 			None => error!("thread '{}' panicked at '{}'{:?}", thread, msg, backtrace),
 		}
 		//also print to stderr
-		let tui_running = TUI_RUNNING.lock().clone();
+		let tui_running = *TUI_RUNNING.lock();
 		if !tui_running {
 			let config = LOGGING_CONFIG.lock();
 

@@ -1,6 +1,6 @@
 # Grin - Build, Configuration, and Running
 
-*Read this in other languages: [Español](build_ES.md), [Korean](build_KR.md), [日本語](build_JP.md), [简体中文](build_ZH-CN.md).*
+*Read this in other languages: [Español](translations/build_ES.md), [Korean](translations/build_KR.md), [日本語](translations/build_JP.md), [简体中文](translations/build_ZH-CN.md).*
 
 ## Supported Platforms
 
@@ -14,8 +14,9 @@ What's working so far?
 
 ## Requirements
 
-* rust 1.34+ (use [rustup]((https://www.rustup.rs/))- i.e. `curl https://sh.rustup.rs -sSf | sh; source $HOME/.cargo/env`)
-  * if rust is already installed, you can simply update version with `rustup update`
+* rust: Install using rustup: https://rustup.rs
+  * Grin currently does not support a minimum version of Rust, it is recommended to build using the latest version.
+  * If rust is already installed, you can update to the latest version by running `rustup update`.
 * clang
 * ncurses and libs (ncurses, ncursesw5)
 * zlib libs (zlib1g-dev or zlib-devel)
@@ -137,4 +138,4 @@ Please note that all mining functions for Grin have moved into a separate, stand
 you can start mining by building and running grin-miner against your running Grin node.
 
 For grin-miner to be able to communicate with your grin node, make sure that you have `enable_stratum_server = true`
-in your `grin-server.toml` configuration file and you have a wallet listener running (`grin-wallet listen`). 
+in your `grin-server.toml` configuration file and you have a wallet listener running (`grin-wallet listen`).

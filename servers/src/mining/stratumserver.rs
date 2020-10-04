@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@
 
 //! Mining Stratum Server
 
-use futures::future::Future;
-use futures::stream::Stream;
-use tokio::io::AsyncRead;
-use tokio::io::{lines, write_all};
+use futures::channel::mpsc;
+use futures::pin_mut;
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
+use tokio::runtime::Runtime;
+use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::util::RwLock;
 use chrono::prelude::Utc;
@@ -26,25 +27,23 @@ use serde;
 use serde_json;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, SystemTime};
-use std::{cmp, thread};
 
 use crate::chain::{self, SyncState};
 use crate::common::stats::{StratumStats, WorkerStats};
 use crate::common::types::StratumServerConfig;
+use crate::core::consensus::graph_weight;
 use crate::core::core::hash::Hashed;
-use crate::core::core::verifier_cache::VerifierCache;
 use crate::core::core::Block;
+use crate::core::global;
 use crate::core::{pow, ser};
 use crate::keychain;
 use crate::mining::mine_block;
-use crate::pool;
-use crate::util;
-
-use futures::sync::mpsc;
+use crate::util::ToHex;
+use crate::{ServerTxPool, ServerVerifierCache};
 
 type Tx = mpsc::UnboundedSender<String>;
 
@@ -52,17 +51,26 @@ type Tx = mpsc::UnboundedSender<String>;
 // http://www.jsonrpc.org/specification
 // RPC Methods
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Represents a compliant JSON RPC 2.0 id.
+/// Valid id: Integer, String.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum JsonId {
+	IntId(u32),
+	StrId(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct RpcRequest {
-	id: String,
+	id: JsonId,
 	jsonrpc: String,
 	method: String,
 	params: Option<Value>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct RpcResponse {
-	id: String,
+	id: JsonId,
 	jsonrpc: String,
 	method: String,
 	result: Option<Value>,
@@ -211,7 +219,7 @@ impl Handler {
 	) -> Self {
 		Handler {
 			id: id,
-			workers: Arc::new(WorkersList::new(stratum_stats.clone())),
+			workers: Arc::new(WorkersList::new(stratum_stats)),
 			sync_state: sync_state,
 			chain: chain,
 			current_state: Arc::new(RwLock::new(State::new(minimum_share_difficulty))),
@@ -335,11 +343,12 @@ impl Handler {
 			bh.write_pre_pow(&mut writer).unwrap();
 			bh.pow.write_pre_pow(&mut writer).unwrap();
 		}
-		let pre_pow = util::to_hex(header_buf);
+		let pre_pow = header_buf.to_hex();
+		let current_state = self.current_state.read();
 		let job_template = JobTemplate {
 			height: bh.height,
-			job_id: (self.current_state.read().current_block_versions.len() - 1) as u64,
-			difficulty: self.current_state.read().minimum_share_difficulty,
+			job_id: (current_state.current_block_versions.len() - 1) as u64,
+			difficulty: current_state.minimum_share_difficulty,
 			pre_pow,
 		};
 		return job_template;
@@ -443,7 +452,7 @@ impl Handler {
 		} else {
 			// Do some validation but dont submit
 			let res = pow::verify_size(&b.header);
-			if !res.is_ok() {
+			if res.is_err() {
 				// Return error status
 				error!(
 						"(Server ID: {}) Failed to validate share at height {}, hash {}, edge_bits {}, nonce {}, job_id {}. {:?}",
@@ -461,10 +470,11 @@ impl Handler {
 			}
 		}
 		// Log this as a valid share
+		self.workers.update_edge_bits(params.edge_bits as u16);
 		let worker = self.workers.get_worker(worker_id)?;
 		let submitted_by = match worker.login {
 			None => worker.id.to_string(),
-			Some(login) => login.clone(),
+			Some(login) => login,
 		};
 
 		info!(
@@ -481,12 +491,11 @@ impl Handler {
 			);
 		self.workers
 			.update_stats(worker_id, |worker_stats| worker_stats.num_accepted += 1);
-		let submit_response;
-		if share_is_block {
-			submit_response = format!("blockfound - {}", b.hash().to_hex());
+		let submit_response = if share_is_block {
+			format!("blockfound - {}", b.hash().to_hex())
 		} else {
-			submit_response = "ok".to_string();
-		}
+			"ok".to_string()
+		};
 		return Ok((
 			serde_json::to_value(submit_response).unwrap(),
 			share_is_block,
@@ -501,7 +510,7 @@ impl Handler {
 		// Issue #1159 - use a serde_json Value type to avoid extra quoting
 		let job_template_value: Value = serde_json::from_str(&job_template_json).unwrap();
 		let job_request = RpcRequest {
-			id: String::from("Stratum"),
+			id: JsonId::StrId(String::from("Stratum")),
 			jsonrpc: String::from("2.0"),
 			method: String::from("job"),
 			params: Some(job_template_value),
@@ -511,14 +520,14 @@ impl Handler {
 			"(Server ID: {}) sending block {} with id {} to stratum clients",
 			self.id, job_template.height, job_template.job_id,
 		);
-		self.workers.broadcast(job_request_json.clone());
+		self.workers.broadcast(job_request_json);
 	}
 
 	pub fn run(
 		&self,
 		config: &StratumServerConfig,
-		tx_pool: &Arc<RwLock<pool::TransactionPool>>,
-		verifier_cache: Arc<RwLock<dyn VerifierCache>>,
+		tx_pool: &ServerTxPool,
+		verifier_cache: ServerVerifierCache,
 	) {
 		debug!("Run main loop");
 		let mut deadline: i64 = 0;
@@ -529,21 +538,21 @@ impl Handler {
 			head = self.chain.head().unwrap();
 			let latest_hash = head.last_block_h;
 
-			// Build a new block if:
-			//    There is a new block on the chain
-			// or We are rebuilding the current one to include new transactions
-			// and there is at least one worker connected
+			// Build a new block if there is at least one worker and
+			// There is a new block on the chain or its time to rebuild
+			// the current one to include new transactions
 			if (current_hash != latest_hash || Utc::now().timestamp() >= deadline)
 				&& self.workers.count() > 0
 			{
 				{
 					debug!("resend updated block");
 					let mut state = self.current_state.write();
-					let mut wallet_listener_url: Option<String> = None;
-					if !config.burn_reward {
-						wallet_listener_url = Some(config.wallet_listener_url.clone());
-					}
-					// If this is a new block, clear the current_block version history
+					let wallet_listener_url = if !config.burn_reward {
+						Some(config.wallet_listener_url.clone())
+					} else {
+						None
+					};
+					// If this is a new block we will clear the current_block version history
 					let clear_blocks = current_hash != latest_hash;
 
 					// Build the new block (version)
@@ -562,22 +571,26 @@ impl Handler {
 
 					current_hash = latest_hash;
 					// set the minimum acceptable share difficulty for this block
-					state.minimum_share_difficulty =
-						cmp::min(config.minimum_share_difficulty, state.current_difficulty);
+					state.minimum_share_difficulty = config.minimum_share_difficulty;
 
 					// set a new deadline for rebuilding with fresh transactions
 					deadline = Utc::now().timestamp() + config.attempt_time_per_block as i64;
 
-					self.workers.update_block_height(new_block.header.height);
-					self.workers
-						.update_network_difficulty(state.current_difficulty);
-
+					// If this is a new block we will clear the current_block version history
 					if clear_blocks {
 						state.current_block_versions.clear();
 					}
+
+					// Update the mining stats
+					self.workers.update_block_height(new_block.header.height);
+					let difficulty = new_block.header.total_difficulty() - head.total_difficulty;
+					self.workers.update_network_difficulty(difficulty.to_num());
+					self.workers.update_network_hashrate();
+
+					// Add this new block candidate onto our list of block versions for this height
 					state.current_block_versions.push(new_block);
-					// Send this job to all connected workers
 				}
+				// Send this job to all connected workers
 				self.broadcast_job();
 			}
 
@@ -591,53 +604,66 @@ impl Handler {
 // Worker Factory Thread Function
 fn accept_connections(listen_addr: SocketAddr, handler: Arc<Handler>) {
 	info!("Start tokio stratum server");
-	let listener = TcpListener::bind(&listen_addr).expect(&format!(
-		"Stratum: Failed to bind to listen address {}",
-		listen_addr
-	));
-	let server = listener
-		.incoming()
-		.for_each(move |socket| {
-			// Spawn a task to process the connection
-			let (tx, rx) = mpsc::unbounded();
-
-			let worker_id = handler.workers.add_worker(tx);
-			info!("Worker {} connected", worker_id);
-
-			let (reader, writer) = socket.split();
-			let reader = BufReader::new(reader);
-			let h = handler.clone();
-			let workers = h.workers.clone();
-			let input = lines(reader)
-				.for_each(move |line| {
-					let request = serde_json::from_str(&line)?;
-					let resp = h.handle_rpc_requests(request, worker_id);
-					workers.send_to(worker_id, resp);
-					Ok(())
-				})
-				.map_err(|e| error!("error {}", e));
-
-			let output = rx.fold(writer, |writer, s| {
-				let s2 = s + "\n";
-				write_all(writer, s2.into_bytes())
-					.map(|(writer, _)| writer)
-					.map_err(|e| error!("cannot send {}", e))
-			});
-
-			let workers = handler.workers.clone();
-			let both = output.map(|_| ()).select(input);
-			tokio::spawn(both.then(move |_| {
-				workers.remove_worker(worker_id);
-				info!("Worker {} disconnected", worker_id);
-				Ok(())
-			}));
-
-			Ok(())
-		})
-		.map_err(|err| {
-			error!("accept error = {:?}", err);
+	let task = async move {
+		let mut listener = TcpListener::bind(&listen_addr).await.unwrap_or_else(|_| {
+			panic!("Stratum: Failed to bind to listen address {}", listen_addr)
 		});
-	tokio::run(server.map(|_| ()).map_err(|_| ()));
+		let server = listener
+			.incoming()
+			.filter_map(|s| async { s.map_err(|e| error!("accept error = {:?}", e)).ok() })
+			.for_each(move |socket| {
+				let handler = handler.clone();
+				async move {
+					// Spawn a task to process the connection
+					let (tx, mut rx) = mpsc::unbounded();
+
+					let worker_id = handler.workers.add_worker(tx);
+					info!("Worker {} connected", worker_id);
+
+					let framed = Framed::new(socket, LinesCodec::new());
+					let (mut writer, mut reader) = framed.split();
+
+					let h = handler.clone();
+					let read = async move {
+						while let Some(line) = reader
+							.try_next()
+							.await
+							.map_err(|e| error!("error reading line: {}", e))?
+						{
+							let request = serde_json::from_str(&line)
+								.map_err(|e| error!("error serializing line: {}", e))?;
+							let resp = h.handle_rpc_requests(request, worker_id);
+							h.workers.send_to(worker_id, resp);
+						}
+
+						Result::<_, ()>::Ok(())
+					};
+
+					let write = async move {
+						while let Some(line) = rx.next().await {
+							writer
+								.send(line)
+								.await
+								.map_err(|e| error!("error writing line: {}", e))?;
+						}
+
+						Result::<_, ()>::Ok(())
+					};
+
+					let task = async move {
+						pin_mut!(read, write);
+						futures::future::select(read, write).await;
+						handler.workers.remove_worker(worker_id);
+						info!("Worker {} disconnected", worker_id);
+					};
+					tokio::spawn(task);
+				}
+			});
+		server.await
+	};
+
+	let mut rt = Runtime::new().unwrap();
+	rt.block_on(task);
 }
 
 // ----------------------------------------
@@ -695,16 +721,20 @@ impl WorkersList {
 	}
 	pub fn remove_worker(&self, worker_id: usize) {
 		self.update_stats(worker_id, |ws| ws.is_connected = false);
-		self.workers_list
-			.write()
+		let mut stratum_stats = self.stratum_stats.write();
+		let mut workers_list = self.workers_list.write();
+		workers_list
 			.remove(&worker_id)
 			.expect("Stratum: no such addr in map");
-		self.stratum_stats.write().num_workers = self.workers_list.read().len();
+
+		stratum_stats.num_workers = workers_list.len();
 	}
 
 	pub fn login(&self, worker_id: usize, login: String, agent: String) -> Result<(), RpcError> {
 		let mut wl = self.workers_list.write();
-		let mut worker = wl.get_mut(&worker_id).ok_or(RpcError::internal_error())?;
+		let mut worker = wl
+			.get_mut(&worker_id)
+			.ok_or_else(RpcError::internal_error)?;
 		worker.login = Some(login);
 		// XXX TODO Future - Validate password?
 		worker.agent = agent;
@@ -728,7 +758,7 @@ impl WorkersList {
 			.read()
 			.worker_stats
 			.get(worker_id)
-			.ok_or(RpcError::internal_error())
+			.ok_or_else(RpcError::internal_error)
 			.map(|ws| ws.clone())
 	}
 
@@ -762,6 +792,14 @@ impl WorkersList {
 		self.workers_list.read().len()
 	}
 
+	pub fn update_edge_bits(&self, edge_bits: u16) {
+		{
+			let mut stratum_stats = self.stratum_stats.write();
+			stratum_stats.edge_bits = edge_bits;
+		}
+		self.update_network_hashrate();
+	}
+
 	pub fn update_block_height(&self, height: u64) {
 		let mut stratum_stats = self.stratum_stats.write();
 		stratum_stats.block_height = height;
@@ -770,6 +808,14 @@ impl WorkersList {
 	pub fn update_network_difficulty(&self, difficulty: u64) {
 		let mut stratum_stats = self.stratum_stats.write();
 		stratum_stats.network_difficulty = difficulty;
+	}
+
+	pub fn update_network_hashrate(&self) {
+		let mut stratum_stats = self.stratum_stats.write();
+		stratum_stats.network_hashrate = 42.0
+			* (stratum_stats.network_difficulty as f64
+				/ graph_weight(stratum_stats.block_height, stratum_stats.edge_bits as u8) as f64)
+			/ 60.0;
 	}
 }
 
@@ -780,8 +826,8 @@ pub struct StratumServer {
 	id: String,
 	config: StratumServerConfig,
 	chain: Arc<chain::Chain>,
-	tx_pool: Arc<RwLock<pool::TransactionPool>>,
-	verifier_cache: Arc<RwLock<dyn VerifierCache>>,
+	pub tx_pool: ServerTxPool,
+	verifier_cache: ServerVerifierCache,
 	sync_state: Arc<SyncState>,
 	stratum_stats: Arc<RwLock<StratumStats>>,
 }
@@ -791,8 +837,8 @@ impl StratumServer {
 	pub fn new(
 		config: StratumServerConfig,
 		chain: Arc<chain::Chain>,
-		tx_pool: Arc<RwLock<pool::TransactionPool>>,
-		verifier_cache: Arc<RwLock<dyn VerifierCache>>,
+		tx_pool: ServerTxPool,
+		verifier_cache: ServerVerifierCache,
 		stratum_stats: Arc<RwLock<StratumStats>>,
 	) -> StratumServer {
 		StratumServer {
@@ -811,10 +857,10 @@ impl StratumServer {
 	/// existing chain anytime required and sending that to the connected
 	/// stratum miner, proxy, or pool, and accepts full solutions to
 	/// be submitted.
-	pub fn run_loop(&mut self, edge_bits: u32, proof_size: usize, sync_state: Arc<SyncState>) {
+	pub fn run_loop(&mut self, proof_size: usize, sync_state: Arc<SyncState>) {
 		info!(
-			"(Server ID: {}) Starting stratum server with edge_bits = {}, proof_size = {}",
-			self.id, edge_bits, proof_size
+			"(Server ID: {}) Starting stratum server with proof_size = {}",
+			self.id, proof_size
 		);
 
 		self.sync_state = sync_state;
@@ -838,7 +884,7 @@ impl StratumServer {
 		{
 			let mut stratum_stats = self.stratum_stats.write();
 			stratum_stats.is_running = true;
-			stratum_stats.edge_bits = edge_bits as u16;
+			stratum_stats.edge_bits = (global::min_edge_bits() + 1) as u16;
 		}
 
 		warn!(
@@ -863,5 +909,150 @@ where
 {
 	params
 		.and_then(|v| serde_json::from_value(v).ok())
-		.ok_or(RpcError::invalid_request())
+		.ok_or_else(RpcError::invalid_request)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Tests deserializing an `RpcRequest` given a String as the id.
+	#[test]
+	fn test_request_deserialize_str() {
+		let expected = RpcRequest {
+			id: JsonId::StrId(String::from("1")),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			params: None,
+		};
+		let json = r#"{"id":"1","method":"login","jsonrpc":"2.0","params":null}"#;
+		let serialized: RpcRequest = serde_json::from_str(json).unwrap();
+
+		assert_eq!(expected, serialized);
+	}
+
+	/// Tests serializing an `RpcRequest` given a String as the id.
+	/// The extra step of deserializing again is due to associative structures not maintaining order.
+	#[test]
+	fn test_request_serialize_str() {
+		let expected = r#"{"id":"1","method":"login","jsonrpc":"2.0","params":null}"#;
+		let rpc = RpcRequest {
+			id: JsonId::StrId(String::from("1")),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			params: None,
+		};
+		let json_actual = serde_json::to_string(&rpc).unwrap();
+
+		let expected_deserialized: RpcRequest = serde_json::from_str(expected).unwrap();
+		let actual_deserialized: RpcRequest = serde_json::from_str(&json_actual).unwrap();
+
+		assert_eq!(expected_deserialized, actual_deserialized);
+	}
+
+	/// Tests deserializing an `RpcResponse` given a String as the id.
+	#[test]
+	fn test_response_deserialize_str() {
+		let expected = RpcResponse {
+			id: JsonId::StrId(String::from("1")),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			result: None,
+			error: None,
+		};
+		let json = r#"{"id":"1","method":"login","jsonrpc":"2.0","params":null}"#;
+		let serialized: RpcResponse = serde_json::from_str(json).unwrap();
+
+		assert_eq!(expected, serialized);
+	}
+
+	/// Tests serializing an `RpcResponse` given a String as the id.
+	/// The extra step of deserializing again is due to associative structures not maintaining order.
+	#[test]
+	fn test_response_serialize_str() {
+		let expected = r#"{"id":"1","method":"login","jsonrpc":"2.0","params":null}"#;
+		let rpc = RpcResponse {
+			id: JsonId::StrId(String::from("1")),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			result: None,
+			error: None,
+		};
+		let json_actual = serde_json::to_string(&rpc).unwrap();
+
+		let expected_deserialized: RpcResponse = serde_json::from_str(expected).unwrap();
+		let actual_deserialized: RpcResponse = serde_json::from_str(&json_actual).unwrap();
+
+		assert_eq!(expected_deserialized, actual_deserialized);
+	}
+
+	/// Tests deserializing an `RpcRequest` given an integer as the id.
+	#[test]
+	fn test_request_deserialize_int() {
+		let expected = RpcRequest {
+			id: JsonId::IntId(1),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			params: None,
+		};
+		let json = r#"{"id":1,"method":"login","jsonrpc":"2.0","params":null}"#;
+		let serialized: RpcRequest = serde_json::from_str(json).unwrap();
+
+		assert_eq!(expected, serialized);
+	}
+
+	/// Tests serializing an `RpcRequest` given an integer as the id.
+	/// The extra step of deserializing again is due to associative structures not maintaining order.
+	#[test]
+	fn test_request_serialize_int() {
+		let expected = r#"{"id":1,"method":"login","jsonrpc":"2.0","params":null}"#;
+		let rpc = RpcRequest {
+			id: JsonId::IntId(1),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			params: None,
+		};
+		let json_actual = serde_json::to_string(&rpc).unwrap();
+
+		let expected_deserialized: RpcRequest = serde_json::from_str(expected).unwrap();
+		let actual_deserialized: RpcRequest = serde_json::from_str(&json_actual).unwrap();
+
+		assert_eq!(expected_deserialized, actual_deserialized);
+	}
+
+	/// Tests deserializing an `RpcResponse` given an integer as the id.
+	#[test]
+	fn test_response_deserialize_int() {
+		let expected = RpcResponse {
+			id: JsonId::IntId(1),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			result: None,
+			error: None,
+		};
+		let json = r#"{"id":1,"method":"login","jsonrpc":"2.0","params":null}"#;
+		let serialized: RpcResponse = serde_json::from_str(json).unwrap();
+
+		assert_eq!(expected, serialized);
+	}
+
+	/// Tests serializing an `RpcResponse` given an integer as the id.
+	/// The extra step of deserializing again is due to associative structures not maintaining order.
+	#[test]
+	fn test_response_serialize_int() {
+		let expected = r#"{"id":1,"method":"login","jsonrpc":"2.0","params":null}"#;
+		let rpc = RpcResponse {
+			id: JsonId::IntId(1),
+			method: String::from("login"),
+			jsonrpc: String::from("2.0"),
+			result: None,
+			error: None,
+		};
+		let json_actual = serde_json::to_string(&rpc).unwrap();
+
+		let expected_deserialized: RpcResponse = serde_json::from_str(expected).unwrap();
+		let actual_deserialized: RpcResponse = serde_json::from_str(&json_actual).unwrap();
+
+		assert_eq!(expected_deserialized, actual_deserialized);
+	}
 }

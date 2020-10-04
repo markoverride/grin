@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 use cursive::theme::{BaseColor, Color, ColorStyle};
 use cursive::traits::Identifiable;
 use cursive::view::View;
-use cursive::views::BoxView;
+use cursive::views::ResizedView;
 use cursive::{Cursive, Printer};
 
 use crate::tui::constants::VIEW_LOGS;
@@ -28,13 +28,13 @@ use std::collections::VecDeque;
 pub struct TUILogsView;
 
 impl TUILogsView {
-	pub fn create() -> Box<dyn View> {
-		let logs_view = BoxView::with_full_screen(LogBufferView::new(200).with_id("logs"));
-		Box::new(logs_view.with_id(VIEW_LOGS))
+	pub fn create() -> impl View {
+		let logs_view = ResizedView::with_full_screen(LogBufferView::new(200).with_name("logs"));
+		logs_view.with_name(VIEW_LOGS)
 	}
 
 	pub fn update(c: &mut Cursive, entry: LogEntry) {
-		c.call_on_id("logs", |t: &mut LogBufferView| {
+		c.call_on_name("logs", |t: &mut LogBufferView| {
 			t.update(entry);
 		});
 	}
@@ -89,7 +89,7 @@ impl View for LogBufferView {
 		let mut i = 0;
 		for entry in self.buffer.iter().take(printer.size.y) {
 			printer.with_color(LogBufferView::color(entry.level), |p| {
-				let log_message = StyledString::plain(&entry.log);
+				let log_message = StyledString::plain(entry.log.as_str());
 				let mut rows: Vec<Row> = LinesIterator::new(&log_message, printer.size.x).collect();
 				rows.reverse(); // So stack traces are in the right order.
 				for row in rows {

@@ -30,7 +30,7 @@ To get involved, read our [contributing docs](CONTRIBUTING.md).
 
 Find us:
 
-* Chat: [Gitter](https://gitter.im/grin_community/Lobby).
+* Chat: [Keybase](https://keybase.io/team/grincoin), more instructions on how to join [here](https://grin.mw/community).
 * Mailing list: join the [~Mimblewimble team](https://launchpad.net/~mimblewimble) and subscribe on Launchpad.
 * Twitter for the Grin council: [@grincouncil](https://twitter.com/grincouncil)
 
@@ -53,8 +53,6 @@ Tom Elvis Jedusor for the first formulation of Mimblewimble.
 Andrew Poelstra for his related work and improvements.
 
 John Tromp for the Cuckoo Cycle proof of work.
-
-J.K. Rowling for making it despite extraordinary adversity.
 
 ## License
 

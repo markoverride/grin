@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -122,12 +122,18 @@ pub enum ErrorKind {
 	/// Tx not valid based on lock_height.
 	#[fail(display = "Transaction Lock Height")]
 	TxLockHeight,
+	/// Tx is not valid due to NRD relative_height restriction.
+	#[fail(display = "NRD Relative Height")]
+	NRDRelativeHeight,
 	/// No chain exists and genesis block is required
 	#[fail(display = "Genesis Block Required")]
 	GenesisBlockRequired,
 	/// Error from underlying tx handling
 	#[fail(display = "Transaction Validation Error: {:?}", _0)]
 	Transaction(transaction::Error),
+	/// Error from underlying block handling
+	#[fail(display = "Block Validation Error: {:?}", _0)]
+	Block(block::Error),
 	/// Anything else
 	#[fail(display = "Other Error: {}", _0)]
 	Other(String),

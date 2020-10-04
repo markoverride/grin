@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,32 +15,30 @@
 //! Base types that the block chain pipeline requires.
 
 use chrono::prelude::{DateTime, Utc};
-use std::sync::Arc;
 
 use crate::core::core::hash::{Hash, Hashed, ZERO_HASH};
 use crate::core::core::{Block, BlockHeader, HeaderVersion};
 use crate::core::pow::Difficulty;
-use crate::core::ser::{self, PMMRIndexHashable};
+use crate::core::ser::{self, PMMRIndexHashable, Readable, Reader, Writeable, Writer};
 use crate::error::{Error, ErrorKind};
-use crate::util::RwLock;
+use crate::util::{RwLock, RwLockWriteGuard};
 
 bitflags! {
 /// Options for block validation
 	pub struct Options: u32 {
 		/// No flags
-		const NONE = 0b00000000;
+		const NONE = 0b0000_0000;
 		/// Runs without checking the Proof of Work, mostly to make testing easier.
-		const SKIP_POW = 0b00000001;
+		const SKIP_POW = 0b0000_0001;
 		/// Adds block while in syncing mode.
-		const SYNC = 0b00000010;
+		const SYNC = 0b0000_0010;
 		/// Block validation on a block we mined ourselves
-		const MINE = 0b00000100;
+		const MINE = 0b0000_0100;
 	}
 }
 
 /// Various status sync can be in, whether it's fast sync or archival.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
-#[allow(missing_docs)]
 pub enum SyncStatus {
 	/// Initial State (we do not yet know if we are/should be syncing)
 	Initial,
@@ -51,28 +49,27 @@ pub enum SyncStatus {
 	AwaitingPeers(bool),
 	/// Downloading block headers
 	HeaderSync {
+		/// current node height
 		current_height: u64,
+		/// height of the most advanced peer
 		highest_height: u64,
 	},
 	/// Downloading the various txhashsets
-	TxHashsetDownload {
-		start_time: DateTime<Utc>,
-		prev_update_time: DateTime<Utc>,
-		update_time: DateTime<Utc>,
-		prev_downloaded_size: u64,
-		downloaded_size: u64,
-		total_size: u64,
-	},
+	TxHashsetDownload(TxHashsetDownloadStats),
 	/// Setting up before validation
 	TxHashsetSetup,
 	/// Validating the kernels
 	TxHashsetKernelsValidation {
+		/// kernels validated
 		kernels: u64,
+		/// kernels in total
 		kernels_total: u64,
 	},
 	/// Validating the range proofs
 	TxHashsetRangeProofsValidation {
+		/// range proofs validated
 		rproofs: u64,
+		/// range proofs in total
 		rproofs_total: u64,
 	},
 	/// Finalizing the new state
@@ -81,16 +78,49 @@ pub enum SyncStatus {
 	TxHashsetDone,
 	/// Downloading blocks
 	BodySync {
+		/// current node height
 		current_height: u64,
+		/// height of the most advanced peer
 		highest_height: u64,
 	},
+	/// Shutdown
 	Shutdown,
+}
+
+/// Stats for TxHashsetDownload stage
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
+pub struct TxHashsetDownloadStats {
+	/// when download started
+	pub start_time: DateTime<Utc>,
+	/// time of the previous update
+	pub prev_update_time: DateTime<Utc>,
+	/// time of the latest update
+	pub update_time: DateTime<Utc>,
+	/// size of the previous chunk
+	pub prev_downloaded_size: u64,
+	/// size of the the latest chunk
+	pub downloaded_size: u64,
+	/// downloaded since the start
+	pub total_size: u64,
+}
+
+impl Default for TxHashsetDownloadStats {
+	fn default() -> Self {
+		TxHashsetDownloadStats {
+			start_time: Utc::now(),
+			update_time: Utc::now(),
+			prev_update_time: Utc::now(),
+			prev_downloaded_size: 0,
+			downloaded_size: 0,
+			total_size: 0,
+		}
+	}
 }
 
 /// Current sync state. Encapsulates the current SyncStatus.
 pub struct SyncState {
 	current: RwLock<SyncStatus>,
-	sync_error: Arc<RwLock<Option<Error>>>,
+	sync_error: RwLock<Option<Error>>,
 }
 
 impl SyncState {
@@ -98,7 +128,7 @@ impl SyncState {
 	pub fn new() -> SyncState {
 		SyncState {
 			current: RwLock::new(SyncStatus::Initial),
-			sync_error: Arc::new(RwLock::new(None)),
+			sync_error: RwLock::new(None),
 		}
 	}
 
@@ -114,27 +144,41 @@ impl SyncState {
 	}
 
 	/// Update the syncing status
-	pub fn update(&self, new_status: SyncStatus) {
-		if self.status() == new_status {
-			return;
-		}
-
-		let mut status = self.current.write();
-
-		debug!("sync_state: sync_status: {:?} -> {:?}", *status, new_status,);
-
-		*status = new_status;
+	pub fn update(&self, new_status: SyncStatus) -> bool {
+		let status = self.current.write();
+		self.update_with_guard(new_status, status)
 	}
 
-	/// Update txhashset downloading progress
-	pub fn update_txhashset_download(&self, new_status: SyncStatus) -> bool {
-		if let SyncStatus::TxHashsetDownload { .. } = new_status {
-			let mut status = self.current.write();
-			*status = new_status;
-			true
+	fn update_with_guard(
+		&self,
+		new_status: SyncStatus,
+		mut status: RwLockWriteGuard<SyncStatus>,
+	) -> bool {
+		if *status == new_status {
+			return false;
+		}
+
+		debug!("sync_state: sync_status: {:?} -> {:?}", *status, new_status,);
+		*status = new_status;
+		true
+	}
+
+	/// Update the syncing status if predicate f is satisfied
+	pub fn update_if<F>(&self, new_status: SyncStatus, f: F) -> bool
+	where
+		F: Fn(SyncStatus) -> bool,
+	{
+		let status = self.current.write();
+		if f(*status) {
+			self.update_with_guard(new_status, status)
 		} else {
 			false
 		}
+	}
+
+	/// Update txhashset downloading progress
+	pub fn update_txhashset_download(&self, stats: TxHashsetDownloadStats) {
+		*self.current.write() = SyncStatus::TxHashsetDownload(stats);
 	}
 
 	/// Communicate sync error
@@ -143,8 +187,8 @@ impl SyncState {
 	}
 
 	/// Get sync error
-	pub fn sync_error(&self) -> Arc<RwLock<Option<Error>>> {
-		Arc::clone(&self.sync_error)
+	pub fn sync_error(&self) -> Option<String> {
+		self.sync_error.read().as_ref().map(|e| e.to_string())
 	}
 
 	/// Clear sync error
@@ -212,11 +256,10 @@ impl TxHashSetRoots {
 			self.output_roots.merged_root(header),
 		);
 
-		if header.output_root != self.output_root(header) {
-			Err(ErrorKind::InvalidRoot.into())
-		} else if header.range_proof_root != self.rproof_root {
-			Err(ErrorKind::InvalidRoot.into())
-		} else if header.kernel_root != self.kernel_root {
+		if header.output_root != self.output_root(header)
+			|| header.range_proof_root != self.rproof_root
+			|| header.kernel_root != self.kernel_root
+		{
 			Err(ErrorKind::InvalidRoot.into())
 		} else {
 			Ok(())
@@ -259,23 +302,36 @@ impl OutputRoots {
 	}
 }
 
-/// A helper to hold the output pmmr position of the txhashset in order to keep them
-/// readable.
-#[derive(Debug)]
-pub struct OutputMMRPosition {
-	/// The hash at the output position in the MMR.
-	pub output_mmr_hash: Hash,
+/// Minimal struct representing a known MMR position and associated block height.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CommitPos {
 	/// MMR position
-	pub position: u64,
+	pub pos: u64,
 	/// Block height
 	pub height: u64,
+}
+
+impl Readable for CommitPos {
+	fn read<R: Reader>(reader: &mut R) -> Result<CommitPos, ser::Error> {
+		let pos = reader.read_u64()?;
+		let height = reader.read_u64()?;
+		Ok(CommitPos { pos, height })
+	}
+}
+
+impl Writeable for CommitPos {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
+		writer.write_u64(self.pos)?;
+		writer.write_u64(self.height)?;
+		Ok(())
+	}
 }
 
 /// The tip of a fork. A handle to the fork ancestry from its leaf in the
 /// blockchain tree. References the max height and the latest and previous
 /// blocks
 /// for convenience and the total difficulty.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct Tip {
 	/// Height of the tip (max height of the fork)
 	pub height: u64,
@@ -328,7 +384,7 @@ impl ser::Writeable for Tip {
 }
 
 impl ser::Readable for Tip {
-	fn read(reader: &mut dyn ser::Reader) -> Result<Tip, ser::Error> {
+	fn read<R: ser::Reader>(reader: &mut R) -> Result<Tip, ser::Error> {
 		let height = reader.read_u64()?;
 		let last = Hash::read(reader)?;
 		let prev = Hash::read(reader)?;
@@ -388,13 +444,48 @@ impl ChainAdapter for NoopAdapter {
 }
 
 /// Status of an accepted block.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BlockStatus {
 	/// Block is the "next" block, updating the chain head.
-	Next,
+	Next {
+		/// Previous block (previous chain head).
+		prev: Tip,
+	},
 	/// Block does not update the chain head and is a fork.
-	Fork,
+	Fork {
+		/// Previous block on this fork.
+		prev: Tip,
+		/// Current chain head.
+		head: Tip,
+		/// Fork point for rewind.
+		fork_point: Tip,
+	},
 	/// Block updates the chain head via a (potentially disruptive) "reorg".
 	/// Previous block was not our previous chain head.
-	Reorg(u64),
+	Reorg {
+		/// Previous block on this fork.
+		prev: Tip,
+		/// Previous chain head.
+		prev_head: Tip,
+		/// Fork point for rewind.
+		fork_point: Tip,
+	},
+}
+
+impl BlockStatus {
+	/// Is this the "next" block?
+	pub fn is_next(&self) -> bool {
+		match *self {
+			BlockStatus::Next { .. } => true,
+			_ => false,
+		}
+	}
+
+	/// Is this block a "reorg"?
+	pub fn is_reorg(&self) -> bool {
+		match *self {
+			BlockStatus::Reorg { .. } => true,
+			_ => false,
+		}
+	}
 }

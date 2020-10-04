@@ -1,4 +1,4 @@
-// Copyright 2019 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,17 +16,16 @@
 
 use chrono::Utc;
 use num::FromPrimitive;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::prelude::*;
 
 use crate::core::ser::{self, Readable, Reader, Writeable, Writer};
 use crate::types::{Capabilities, PeerAddr, ReasonForBan};
 use grin_store::{self, option_to_not_found, to_key, Error};
 
-const DB_NAME: &'static str = "peer";
-const STORE_SUBPATH: &'static str = "peers";
+const DB_NAME: &str = "peer";
+const STORE_SUBPATH: &str = "peers";
 
-const PEER_PREFIX: u8 = 'P' as u8;
+const PEER_PREFIX: u8 = b'P';
 
 // Types of messages
 enum_from_primitive! {
@@ -75,7 +74,7 @@ impl Writeable for PeerData {
 }
 
 impl Readable for PeerData {
-	fn read(reader: &mut dyn Reader) -> Result<PeerData, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<PeerData, ser::Error> {
 		let addr = PeerAddr::read(reader)?;
 		let capab = reader.read_u32()?;
 		let ua = reader.read_bytes_len_prefix()?;
@@ -146,31 +145,28 @@ impl PeerStore {
 		batch.commit()
 	}
 
+	/// Find some peers in our local db.
 	pub fn find_peers(
 		&self,
 		state: State,
 		cap: Capabilities,
 		count: usize,
 	) -> Result<Vec<PeerData>, Error> {
-		let mut peers = self
+		let key = to_key(PEER_PREFIX, "");
+		let peers = self
 			.db
-			.iter::<PeerData>(&to_key(PEER_PREFIX, &mut "".to_string().into_bytes()))?
+			.iter::<PeerData>(&key)?
 			.map(|(_, v)| v)
 			.filter(|p| p.flags == state && p.capabilities.contains(cap))
-			.collect::<Vec<_>>();
-		peers[..].shuffle(&mut thread_rng());
-		Ok(peers.iter().take(count).cloned().collect())
+			.choose_multiple(&mut thread_rng(), count);
+		Ok(peers)
 	}
 
 	/// List all known peers
 	/// Used for /v1/peers/all api endpoint
 	pub fn all_peers(&self) -> Result<Vec<PeerData>, Error> {
-		let key = to_key(PEER_PREFIX, &mut "".to_string().into_bytes());
-		Ok(self
-			.db
-			.iter::<PeerData>(&key)?
-			.map(|(_, v)| v)
-			.collect::<Vec<_>>())
+		let key = to_key(PEER_PREFIX, "");
+		Ok(self.db.iter::<PeerData>(&key)?.map(|(_, v)| v).collect())
 	}
 
 	/// Convenience method to load a peer data, update its status and save it
@@ -221,5 +217,5 @@ impl PeerStore {
 
 // Ignore the port unless ip is loopback address.
 fn peer_key(peer_addr: PeerAddr) -> Vec<u8> {
-	to_key(PEER_PREFIX, &mut peer_addr.as_key().into_bytes())
+	to_key(PEER_PREFIX, &peer_addr.as_key())
 }
